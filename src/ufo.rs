@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -297,11 +298,28 @@ impl Ufo {
 
     /// Every file of the UFO package: relative path -> content. Fails where
     /// ufoLib2's save fails (see [`Ufo::validate`]).
+    ///
+    /// This holds the whole package in memory; [`Ufo::save`] and [`Ufo::sync`]
+    /// render each glyph only while writing it.
     pub fn to_files(&self) -> Result<BTreeMap<PathBuf, Vec<u8>>, Error> {
+        let package = self.package()?;
+        let mut files: BTreeMap<PathBuf, Vec<u8>> = package.files.into_iter().collect();
+        let rendered: Vec<(PathBuf, Vec<u8>)> = package
+            .glyphs
+            .into_par_iter()
+            .map(|(path, g)| (path, g.to_glif().into_bytes()))
+            .collect();
+        files.extend(rendered);
+        Ok(files)
+    }
+
+    /// The package's files, with the .glif files left to render: validates
+    /// first, so nothing is written for a UFO that ufoLib2 would refuse.
+    fn package(&self) -> Result<Package<'_>, Error> {
         self.validate()?;
-        let mut files = BTreeMap::new();
+        let mut files = Vec::new();
         let mut put = |path: &str, content: String| {
-            files.insert(PathBuf::from(path), content.into_bytes());
+            files.push((PathBuf::from(path), content.into_bytes()));
         };
         let mut meta = Dict::new();
         meta.insert("creator".into(), "com.github.fonttools.ufoLib".into());
@@ -328,27 +346,18 @@ impl Ufo {
             ])])),
         );
         let mut existing = HashSet::new();
-        let file_names: Vec<String> = self
-            .glyphs
-            .iter()
-            .map(|g| glyph_file_name(&g.name, &mut existing))
-            .collect();
         let mut contents = Dict::new();
-        for (g, f) in self.glyphs.iter().zip(&file_names) {
-            contents.insert(g.name.clone(), f.clone().into());
+        let mut glyphs = Vec::with_capacity(self.glyphs.len());
+        for g in &self.glyphs {
+            let file = glyph_file_name(&g.name, &mut existing);
+            glyphs.push((Path::new("glyphs").join(&file), g));
+            contents.insert(g.name.clone(), file.into());
         }
         put(
             "glyphs/contents.plist",
             plist::to_file(&Value::Dict(contents)),
         );
-        let rendered: Vec<(PathBuf, Vec<u8>)> = self
-            .glyphs
-            .par_iter()
-            .zip(file_names.par_iter())
-            .map(|(g, f)| (Path::new("glyphs").join(f), g.to_glif().into_bytes()))
-            .collect();
-        files.extend(rendered);
-        Ok(files)
+        Ok(Package { files, glyphs })
     }
 
     /// Write the UFO to `path`, which must not exist yet.
@@ -357,9 +366,10 @@ impl Ufo {
             return Err(format!("{} already exists", path.display()).into());
         }
         let timer = crate::Timer::new();
-        let files = self.to_files()?;
+        let package = self.package()?;
         timer.lap("serialize");
-        write_files(path, &files)?;
+        std::fs::create_dir_all(path.join("glyphs"))?;
+        package.for_each_file(|rel, content| Ok(std::fs::write(path.join(rel), content)?))?;
         timer.lap("write");
         Ok(())
     }
@@ -369,26 +379,20 @@ impl Ufo {
     /// (files written, files removed).
     pub fn sync(&self, path: &Path) -> Result<(usize, usize), Error> {
         let timer = crate::Timer::new();
-        let files = self.to_files()?;
+        let package = self.package()?;
         timer.lap("serialize");
         std::fs::create_dir_all(path.join("glyphs"))?;
-        let written = files
-            .par_iter()
-            .map(|(rel, content)| -> Result<bool, Error> {
-                let full = path.join(rel);
-                match std::fs::read(&full) {
-                    Ok(old) if old == *content => Ok(false),
-                    _ => {
-                        std::fs::write(&full, content)?;
-                        Ok(true)
-                    }
-                }
-            })
-            .collect::<Result<Vec<bool>, Error>>()?
-            .into_iter()
-            .filter(|w| *w)
-            .count();
+        let written = AtomicUsize::new(0);
+        package.for_each_file(|rel, content| {
+            let full = path.join(rel);
+            if !same_content(&full, content) {
+                std::fs::write(&full, content)?;
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        })?;
         timer.lap("compare/write");
+        let produced: HashSet<&Path> = package.paths().collect();
         let mut removed = 0;
         for dir in [path.to_path_buf(), path.join("glyphs")] {
             for entry in std::fs::read_dir(&dir)? {
@@ -396,24 +400,57 @@ impl Ufo {
                 if !entry.file_type()?.is_file() {
                     continue;
                 }
-                let rel = entry.path().strip_prefix(path)?.to_path_buf();
-                if !files.contains_key(&rel) {
+                if !produced.contains(entry.path().strip_prefix(path)?) {
                     std::fs::remove_file(entry.path())?;
                     removed += 1;
                 }
             }
         }
-        Ok((written, removed))
+        Ok((written.into_inner(), removed))
     }
 }
 
-fn write_files(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<(), Error> {
-    std::fs::create_dir_all(root.join("glyphs"))?;
-    files
-        .par_iter()
-        .map(|(rel, content)| std::fs::write(root.join(rel), content).map_err(Error::from))
-        .collect::<Result<Vec<()>, Error>>()?;
-    Ok(())
+/// A UFO package ready to write: the top-level files and `contents.plist`
+/// rendered, the .glif files as the glyphs to render.
+struct Package<'a> {
+    files: Vec<(PathBuf, Vec<u8>)>,
+    glyphs: Vec<(PathBuf, &'a Glyph)>,
+}
+
+impl Package<'_> {
+    /// Every file's path relative to the package.
+    fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files
+            .iter()
+            .map(|(p, _)| p.as_path())
+            .chain(self.glyphs.iter().map(|(p, _)| p.as_path()))
+    }
+
+    /// Calls `f` on every file, in parallel. Each .glif is rendered just
+    /// before `f` sees it and dropped right after, so the package's glyph
+    /// files are never all in memory at once.
+    fn for_each_file(
+        &self,
+        f: impl Fn(&Path, &[u8]) -> Result<(), Error> + Sync,
+    ) -> Result<(), Error> {
+        self.files
+            .par_iter()
+            .try_for_each(|(rel, content)| f(rel, content))?;
+        self.glyphs
+            .par_iter()
+            .try_for_each(|(rel, g)| f(rel, g.to_glif().as_bytes()))
+    }
+}
+
+/// Whether the file at `path` already holds `content`. The length is
+/// checked first, so a changed file is usually not read.
+fn same_content(path: &Path, content: &[u8]) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() && meta.len() == content.len() as u64 => {
+            std::fs::read(path).is_ok_and(|old| old == content)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
