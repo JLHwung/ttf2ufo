@@ -95,14 +95,21 @@ impl Glyph {
         s.push_str("  <outline>\n");
         for contour in &self.contours {
             s.push_str("    <contour>\n");
+            // hot path: written by hand instead of through `write!`
+            let mut num = itoa::Buffer::new();
             for p in contour {
+                s.push_str("      <point x=\"");
+                s.push_str(num.format(p.x));
+                s.push_str("\" y=\"");
+                s.push_str(num.format(p.y));
                 match p.typ {
                     Some(t) => {
-                        writeln!(s, "      <point x=\"{}\" y=\"{}\" type=\"{t}\"/>", p.x, p.y)
+                        s.push_str("\" type=\"");
+                        s.push_str(t);
+                        s.push_str("\"/>\n");
                     }
-                    None => writeln!(s, "      <point x=\"{}\" y=\"{}\"/>", p.x, p.y),
+                    None => s.push_str("\"/>\n"),
                 }
-                .unwrap();
             }
             s.push_str("    </contour>\n");
         }
@@ -125,7 +132,7 @@ impl Glyph {
         s.push_str("  </outline>\n");
         if !self.lib.is_empty() {
             s.push_str("  <lib>\n");
-            plist::write_value(&mut s, &Value::Dict(self.lib.clone()), 2);
+            plist::write_dict(&mut s, &self.lib, 2);
             s.push_str("  </lib>\n");
         }
         s.push_str("</glyph>\n");
@@ -212,28 +219,19 @@ impl Ufo {
         let mut meta = Dict::new();
         meta.insert("creator".into(), "com.github.fonttools.ufoLib".into());
         meta.insert("formatVersion".into(), 3.into());
-        put("metainfo.plist", plist::to_file(&Value::Dict(meta)));
-        put(
-            "fontinfo.plist",
-            plist::to_file(&Value::Dict(self.info.clone())),
-        );
+        put("metainfo.plist", plist::dict_file(&meta));
+        put("fontinfo.plist", plist::dict_file(&self.info));
         if !self.groups.is_empty() {
-            put(
-                "groups.plist",
-                plist::to_file(&Value::Dict(self.groups.clone())),
-            );
+            put("groups.plist", plist::dict_file(&self.groups));
         }
         if !self.kerning.is_empty() {
-            put(
-                "kerning.plist",
-                plist::to_file(&Value::Dict(self.kerning.clone())),
-            );
+            put("kerning.plist", plist::dict_file(&self.kerning));
         }
         if !self.features.is_empty() {
             put("features.fea", self.features.clone());
         }
         if !self.lib.is_empty() {
-            put("lib.plist", plist::to_file(&Value::Dict(self.lib.clone())));
+            put("lib.plist", plist::dict_file(&self.lib));
         }
         put(
             "layercontents.plist",
@@ -242,7 +240,6 @@ impl Ufo {
                 "glyphs".into(),
             ])])),
         );
-
         let mut existing = HashSet::new();
         let file_names: Vec<String> = self
             .glyphs
@@ -272,14 +269,21 @@ impl Ufo {
         if path.exists() {
             return Err(format!("{} already exists", path.display()).into());
         }
-        write_files(path, &self.to_files())
+        let timer = crate::Timer::new();
+        let files = self.to_files();
+        timer.lap("serialize");
+        write_files(path, &files)?;
+        timer.lap("write");
+        Ok(())
     }
 
     /// Update the UFO at `path` in place: rewrite only files whose content
     /// changed and remove files the UFO no longer has. Returns
     /// (files written, files removed).
     pub fn sync(&self, path: &Path) -> Result<(usize, usize), Error> {
+        let timer = crate::Timer::new();
         let files = self.to_files();
+        timer.lap("serialize");
         std::fs::create_dir_all(path.join("glyphs"))?;
         let written = files
             .par_iter()
@@ -297,6 +301,7 @@ impl Ufo {
             .into_iter()
             .filter(|w| *w)
             .count();
+        timer.lap("compare/write");
         let mut removed = 0;
         for dir in [path.to_path_buf(), path.join("glyphs")] {
             for entry in std::fs::read_dir(&dir)? {

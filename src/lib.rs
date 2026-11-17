@@ -21,20 +21,46 @@ use read_fonts::{FontRef, TableProvider};
 use plist::{Dict, Value};
 use ufo::Ufo;
 
+/// Print how long each stage took when TTF2UFO_TIMING is set.
+pub(crate) struct Timer {
+    start: std::time::Instant,
+    enabled: bool,
+}
+
+impl Timer {
+    pub(crate) fn new() -> Self {
+        Timer {
+            start: std::time::Instant::now(),
+            enabled: std::env::var_os("TTF2UFO_TIMING").is_some(),
+        }
+    }
+
+    pub(crate) fn lap(&self, what: &str) {
+        if self.enabled {
+            eprintln!("{:>8.3}s {what}", self.start.elapsed().as_secs_f64());
+        }
+    }
+}
+
 /// Extract a UFO from TrueType font data, as `extractufo` does.
 pub fn extract(data: &[u8]) -> Result<Ufo, Error> {
+    let timer = Timer::new();
     let font = FontRef::new(data)?;
     if font.table_data(Tag::new(b"glyf")).is_none() {
         return Err("only TrueType-flavored fonts (with a 'glyf' table) are supported".into());
     }
     let names = names::glyph_order(&font)?;
+    timer.lap("glyph order");
 
     // extractOpenTypeInfo
     let (info, mut lib) = info::extract_info(&font)?;
+    timer.lap("info");
 
     // extractOpenTypeGlyphs + extractUnicodeVariationSequences
     let char_map = cmap::char_map(&font, names.len())?;
+    timer.lap("cmap");
     let mut glyphs = glyphs::extract_glyphs(&font, &names, &char_map.unicodes)?;
+    timer.lap("glyphs");
     if !char_map.uvs.is_empty() {
         let mut sequences = Dict::new();
         for (selector, entries) in &char_map.uvs {
@@ -69,9 +95,11 @@ pub fn extract(data: &[u8]) -> Result<Ufo, Error> {
 
     // extractOpenTypeKerning
     let (kerning, groups) = layout::extract_kerning(&font, &names)?;
+    timer.lap("kerning");
 
     // extractOpenTypeFeatures
     let features = features::extract_features(&font)?;
+    timer.lap("features");
 
     // extractInstructions (glyph programs are handled with the glyphs)
     let mut tt = Dict::new();
@@ -133,6 +161,7 @@ pub fn extract(data: &[u8]) -> Result<Ufo, Error> {
         glyphs[gid].anchors.extend(anchors);
     }
 
+    timer.lap("instructions, anchors");
     Ok(Ufo {
         info,
         lib,

@@ -16,6 +16,8 @@ memory first, then only files whose content changed are rewritten and files
 the font no longer produces (stale `.glif` files, a dropped `kerning.plist`)
 are removed. Unchanged files keep their mtime, so git does not re-hash them.
 
+Set `TTF2UFO_TIMING=1` to print how long each stage takes.
+
 ## What is extracted
 
 Everything `extractufo` writes for a TrueType font:

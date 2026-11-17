@@ -3,6 +3,7 @@
 
 use std::fmt::Write as _;
 
+use rayon::prelude::*;
 use read_fonts::tables::glyf::{Anchor as TtAnchor, CompositeGlyphFlags, Glyph as TtGlyph};
 use read_fonts::types::GlyphId;
 use read_fonts::{FontRef, TableProvider};
@@ -45,9 +46,9 @@ pub fn extract_glyphs(
     let vorg = font.vorg().ok();
     let num = names.len();
 
-    let mut glyphs: Vec<Glyph> = Vec::with_capacity(num);
-    let mut programs: Vec<Option<Vec<u8>>> = Vec::with_capacity(num);
-    for (gid, name) in names.iter().enumerate() {
+    // Glyphs are independent of each other here, so read them in parallel.
+    let read_glyph = |gid: usize| -> Result<(Glyph, Option<Vec<u8>>), Error> {
+        let name = &names[gid];
         let id = GlyphId::new(gid as u32);
         let width = hmtx.advance(id).unwrap_or(0) as i64;
         let lsb = hmtx.side_bearing(id).unwrap_or(0) as i64;
@@ -177,9 +178,14 @@ pub fn extract_glyphs(
                 }
             }
         }
-        glyphs.push(glyph);
-        programs.push(program);
-    }
+        Ok((glyph, program))
+    };
+    let (mut glyphs, programs): (Vec<Glyph>, Vec<Option<Vec<u8>>>) = (0..num)
+        .into_par_iter()
+        .map(read_glyph)
+        .collect::<Result<Vec<_>, Error>>()?
+        .into_iter()
+        .unzip();
 
     // extractGlyphPrograms: needs every glyph's outline for the component hash
     let index: std::collections::HashMap<&str, usize> = names
@@ -187,31 +193,34 @@ pub fn extract_glyphs(
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
-    for gid in 0..num {
-        let Some(program) = &programs[gid] else {
-            continue;
-        };
-        let mut hash_data = format!("w{}", glyphs[gid].width);
-        hash_glyph(&glyphs, &index, gid, true, &mut hash_data)?;
-        let id = if hash_data.len() >= 128 {
-            Sha512::digest(hash_data.as_bytes()).iter().fold(
-                String::with_capacity(128),
-                |mut h, b| {
-                    let _ = write!(h, "{b:02x}");
-                    h
-                },
-            )
-        } else {
-            hash_data
-        };
-        let mut instructions = Dict::new();
-        instructions.insert("formatVersion".into(), "1".into());
-        instructions.insert("id".into(), id.into());
-        instructions.insert("assembly".into(), lib_assembly(program)?.into());
-        glyphs[gid].lib.insert(
-            "public.truetype.instructions".into(),
-            Value::Dict(instructions),
-        );
+    let instructions: Vec<(usize, Dict)> = (0..num)
+        .into_par_iter()
+        .filter_map(|gid| programs[gid].as_ref().map(|p| (gid, p)))
+        .map(|(gid, program)| -> Result<(usize, Dict), Error> {
+            let mut hash_data = format!("w{}", glyphs[gid].width);
+            hash_glyph(&glyphs, &index, gid, true, &mut hash_data)?;
+            let id = if hash_data.len() >= 128 {
+                Sha512::digest(hash_data.as_bytes()).iter().fold(
+                    String::with_capacity(128),
+                    |mut h, b| {
+                        let _ = write!(h, "{b:02x}");
+                        h
+                    },
+                )
+            } else {
+                hash_data
+            };
+            let mut instructions = Dict::new();
+            instructions.insert("formatVersion".into(), "1".into());
+            instructions.insert("id".into(), id.into());
+            instructions.insert("assembly".into(), lib_assembly(program)?.into());
+            Ok((gid, instructions))
+        })
+        .collect::<Result<_, Error>>()?;
+    for (gid, dict) in instructions {
+        glyphs[gid]
+            .lib
+            .insert("public.truetype.instructions".into(), Value::Dict(dict));
     }
     Ok(glyphs)
 }
@@ -227,10 +236,16 @@ fn hash_glyph(
     out: &mut String,
 ) -> Result<(), Error> {
     let glyph = &glyphs[gid];
+    // hot path: f"{tag}{x:g}{y:+g}" written by hand (coordinates are ints)
+    let mut num = itoa::Buffer::new();
     for contour in &glyph.contours {
         for p in contour {
-            let tag = p.typ.map_or('o', |t| t.chars().next().unwrap());
-            write!(out, "{tag}{}{:+}", p.x, p.y)?;
+            out.push(p.typ.map_or('o', |t| t.as_bytes()[0] as char));
+            out.push_str(num.format(p.x));
+            if p.y >= 0 {
+                out.push('+');
+            }
+            out.push_str(num.format(p.y));
         }
         out.push('|');
     }

@@ -1,6 +1,7 @@
 //! Property lists, serialized exactly like fontTools.misc.plistlib (via lxml)
 //! with `sort_keys=True` and two-space indentation.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -67,8 +68,11 @@ impl<T: Into<Value>> From<Vec<T>> for Value {
 }
 
 /// Escape element text as lxml does.
-pub fn escape_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+pub fn escape_text(s: &str) -> Cow<'_, str> {
+    if !s.contains(['&', '<', '>', '\r']) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -78,12 +82,15 @@ pub fn escape_text(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Escape an attribute value as lxml does.
-pub fn escape_attr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+pub fn escape_attr(s: &str) -> Cow<'_, str> {
+    if !s.contains(['&', '<', '>', '"', '\n', '\r', '\t']) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -96,52 +103,95 @@ pub fn escape_attr(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
-fn plist_string(s: &str) -> String {
-    escape_text(s)
+/// Two spaces per indentation level, without allocating for common depths.
+fn pad(indent: usize) -> Cow<'static, str> {
+    const SPACES: &str = "                                                                ";
+    match SPACES.get(..2 * indent) {
+        Some(p) => Cow::Borrowed(p),
+        None => Cow::Owned("  ".repeat(indent)),
+    }
 }
 
 /// Append `value` as plist XML, one element per line, at `indent` levels.
 pub fn write_value(out: &mut String, value: &Value, indent: usize) {
-    let pad = "  ".repeat(indent);
+    let pad = pad(indent);
+    let pad = pad.as_ref();
     match value {
-        Value::Bool(true) => writeln!(out, "{pad}<true/>"),
-        Value::Bool(false) => writeln!(out, "{pad}<false/>"),
-        Value::Int(i) => writeln!(out, "{pad}<integer>{i}</integer>"),
-        Value::Real(f) => writeln!(out, "{pad}<real>{}</real>", float_repr(*f)),
-        Value::Str(s) if s.is_empty() => writeln!(out, "{pad}<string></string>"),
-        Value::Str(s) => writeln!(out, "{pad}<string>{}</string>", plist_string(s)),
-        Value::Array(items) if items.is_empty() => writeln!(out, "{pad}<array/>"),
+        Value::Bool(true) => {
+            out.push_str(pad);
+            out.push_str("<true/>\n");
+        }
+        Value::Bool(false) => {
+            out.push_str(pad);
+            out.push_str("<false/>\n");
+        }
+        Value::Int(i) => writeln!(out, "{pad}<integer>{i}</integer>").unwrap(),
+        Value::Real(f) => writeln!(out, "{pad}<real>{}</real>", float_repr(*f)).unwrap(),
+        Value::Str(s) => {
+            out.push_str(pad);
+            out.push_str("<string>");
+            out.push_str(&escape_text(s));
+            out.push_str("</string>\n");
+        }
+        Value::Array(items) if items.is_empty() => {
+            out.push_str(pad);
+            out.push_str("<array/>\n");
+        }
         Value::Array(items) => {
-            writeln!(out, "{pad}<array>").unwrap();
+            out.push_str(pad);
+            out.push_str("<array>\n");
             for item in items {
                 write_value(out, item, indent + 1);
             }
-            writeln!(out, "{pad}</array>")
+            out.push_str(pad);
+            out.push_str("</array>\n");
         }
-        Value::Dict(d) if d.is_empty() => writeln!(out, "{pad}<dict/>"),
-        Value::Dict(d) => {
-            writeln!(out, "{pad}<dict>").unwrap();
-            for (k, v) in d {
-                writeln!(out, "{pad}  <key>{}</key>", plist_string(k)).unwrap();
-                write_value(out, v, indent + 1);
-            }
-            writeln!(out, "{pad}</dict>")
-        }
+        Value::Dict(d) => write_dict(out, d, indent),
     }
-    .unwrap();
+}
+
+/// Append a dict as plist XML at `indent` levels.
+pub fn write_dict(out: &mut String, dict: &Dict, indent: usize) {
+    let pad = pad(indent);
+    let pad = pad.as_ref();
+    if dict.is_empty() {
+        out.push_str(pad);
+        out.push_str("<dict/>\n");
+        return;
+    }
+    out.push_str(pad);
+    out.push_str("<dict>\n");
+    for (k, v) in dict {
+        out.push_str(pad);
+        out.push_str("  <key>");
+        out.push_str(&escape_text(k));
+        out.push_str("</key>\n");
+        write_value(out, v, indent + 1);
+    }
+    out.push_str(pad);
+    out.push_str("</dict>\n");
 }
 
 /// A complete .plist file, as `fontTools.misc.plistlib.dumps` writes it.
 pub fn to_file(root: &Value) -> String {
+    file_with(|s| write_value(s, root, 1))
+}
+
+/// A complete .plist file whose root is `dict`.
+pub fn dict_file(dict: &Dict) -> String {
+    file_with(|s| write_dict(s, dict, 1))
+}
+
+fn file_with(body: impl FnOnce(&mut String)) -> String {
     let mut s = String::from(
         "<?xml version='1.0' encoding='UTF-8'?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n",
     );
-    write_value(&mut s, root, 1);
+    body(&mut s);
     s.push_str("</plist>\n");
     s
 }
