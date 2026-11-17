@@ -12,15 +12,39 @@ use crate::Error;
 use crate::plist::{self, Dict, Value, escape_attr};
 use crate::pyfmt::Num;
 
-/// A contour point in font units.
-#[derive(Clone, Debug, PartialEq)]
+/// The segment type of an on-curve point. Contours from TrueType outlines
+/// are closed, so there is no `move`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointType {
+    /// `line`
+    Line,
+    /// `curve` (cubic)
+    Curve,
+    /// `qcurve` (quadratic)
+    QCurve,
+}
+
+impl PointType {
+    /// The `type` attribute in a .glif file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PointType::Line => "line",
+            PointType::Curve => "curve",
+            PointType::QCurve => "qcurve",
+        }
+    }
+}
+
+/// A contour point in font units. Kept small (12 bytes): a large CJK font
+/// has tens of millions of them.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     /// Horizontal position.
-    pub x: i64,
+    pub x: i32,
     /// Vertical position.
-    pub y: i64,
+    pub y: i32,
     /// Segment type; `None` for off-curve points.
-    pub typ: Option<&'static str>,
+    pub typ: Option<PointType>,
 }
 
 /// A reference to another glyph, placed with an affine transformation.
@@ -129,7 +153,7 @@ impl Glyph {
                 match p.typ {
                     Some(t) => {
                         s.push_str("\" type=\"");
-                        s.push_str(t);
+                        s.push_str(t.as_str());
                         s.push_str("\"/>\n");
                     }
                     None => s.push_str("\"/>\n"),
@@ -232,7 +256,7 @@ fn check_outline(glyph: &Glyph) -> Result<(), Error> {
             match p.typ {
                 None => off_curves += 1,
                 Some(t) => {
-                    if t == "curve" && off_curves > 2 {
+                    if t == PointType::Curve && off_curves > 2 {
                         return Err("too many offcurve points before curve point.".into());
                     }
                     off_curves = 0;
@@ -456,6 +480,11 @@ fn same_content(path: &Path, content: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn point_stays_small() {
+        assert_eq!(std::mem::size_of::<Point>(), 12);
+    }
 
     /// File names from fontTools' `userNameToFileName(name, existing,
     /// suffix=".glif")`, each added to `existing` in turn.

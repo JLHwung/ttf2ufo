@@ -14,7 +14,7 @@ use crate::instructions::lib_assembly;
 use crate::names::GlyphOrder;
 use crate::plist::{Dict, Value};
 use crate::pyfmt::{Num, float_repr_signed};
-use crate::ufo::{Component, Glyph, Point};
+use crate::ufo::{Component, Glyph, Point, PointType};
 
 /// fontTools' otRound.
 fn ot_round(v: f64) -> i64 {
@@ -44,7 +44,7 @@ pub fn extract_glyphs(
         let name = &names.names()[gid];
         let id = GlyphId::new(gid as u32);
         let width = hmtx.advance(id).unwrap_or(0) as i64;
-        let lsb = hmtx.side_bearing(id).unwrap_or(0) as i64;
+        let lsb = hmtx.side_bearing(id).unwrap_or(0) as i32;
         let mut glyph = Glyph::new(name.clone(), width);
         glyph.unicodes = unicodes[gid].clone();
         let mut program = None;
@@ -53,7 +53,7 @@ pub fn extract_glyphs(
             Some(TtGlyph::Simple(g)) => {
                 program = Some(g.instructions().to_vec());
                 // fontTools' glyph set shifts x by (hmtx lsb - stored xMin)
-                let offset = lsb - g.x_min() as i64;
+                let offset = lsb - g.x_min() as i32;
                 let pts: Vec<_> = g.points().collect();
                 let mut start = 0usize;
                 for end in g.end_pts_of_contours() {
@@ -61,26 +61,31 @@ pub fn extract_glyphs(
                     let contour = pts.get(start..end).ok_or("bad glyf contour")?;
                     start = end;
                     let last = contour.last().ok_or("empty glyf contour")?;
+                    let off_curve = |cubic: bool| {
+                        if cubic {
+                            PointType::Curve
+                        } else {
+                            PointType::QCurve
+                        }
+                    };
                     let mut seg = if last.on_curve {
-                        "line"
-                    } else if last.cubic {
-                        "curve"
+                        PointType::Line
                     } else {
-                        "qcurve"
+                        off_curve(last.cubic)
                     };
                     let mut points = Vec::with_capacity(contour.len());
                     for p in contour {
                         let typ = if p.on_curve {
                             let t = seg;
-                            seg = "line";
+                            seg = PointType::Line;
                             Some(t)
                         } else {
-                            seg = if p.cubic { "curve" } else { "qcurve" };
+                            seg = off_curve(p.cubic);
                             None
                         };
                         points.push(Point {
-                            x: p.x as i64 + offset,
-                            y: p.y as i64,
+                            x: p.x as i32 + offset,
+                            y: p.y as i32,
                             typ,
                         });
                     }
@@ -206,7 +211,7 @@ fn hash_glyph(
     let mut num = itoa::Buffer::new();
     for contour in &glyph.contours {
         for p in contour {
-            out.push(p.typ.map_or('o', |t| t.as_bytes()[0] as char));
+            out.push(p.typ.map_or('o', |t| t.as_str().as_bytes()[0] as char));
             out.push_str(num.format(p.x));
             if p.y >= 0 {
                 out.push('+');
