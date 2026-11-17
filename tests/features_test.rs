@@ -57,7 +57,8 @@ fn assert_same(name: &str, got: &str, expected: &str) {
 fn check(font: &str) {
     let bytes = std::fs::read(data(&format!("fonts/{font}.ttf"))).unwrap();
     let font_ref = FontRef::new(&bytes).unwrap();
-    let got = extract_features(&font_ref).unwrap();
+    let names = ttf2ufo::names::glyph_order(&font_ref).unwrap();
+    let got = extract_features(&font_ref, &names).unwrap();
     let expected =
         std::fs::read_to_string(data(&format!("expected/{font}.ufo/features.fea"))).unwrap();
     assert_same(font, &got, &expected);

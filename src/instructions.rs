@@ -1,7 +1,11 @@
 //! TrueType bytecode disassembly: a port of ufo-extractor's `InstructionStream`
 //! (extractor/stream.py), producing fontTools ("ttx") or VTT assembly.
 
+use read_fonts::types::Tag;
+use read_fonts::{FontRef, TableProvider};
+
 use crate::Error;
+use crate::plist::{Dict, Value};
 
 /// (opcode, mnemonic, argBits, descriptive name), as in fontTools' ttProgram.
 const STREAM_INSTRUCTIONS: &[(u8, &str, u8, &str)] = &[
@@ -171,6 +175,46 @@ pub fn ttx_assembly(bytecode: &[u8]) -> Result<String, Error> {
 /// `InstructionStream(program_bytes=...).vtt_assembly` does.
 pub fn vtt_assembly(bytecode: &[u8]) -> Result<String, Error> {
     assembly(bytecode, Dialect::Vtt)
+}
+
+/// The font-wide `public.truetype.instructions` lib entry: the `cvt `,
+/// `fpgm` and `prep` tables and the `maxp` limits.
+pub fn font_lib(font: &FontRef) -> Result<Dict, Error> {
+    let mut tt = Dict::new();
+    tt.insert("formatVersion".into(), "1".into());
+    if let Some(cvt) = font.table_data(Tag::new(b"cvt ")) {
+        let values: Dict = cvt
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i.to_string(), i16::from_be_bytes([c[0], c[1]]).into()))
+            .collect();
+        tt.insert("controlValue".into(), Value::Dict(values));
+    }
+    if let Some(fpgm) = font.table_data(Tag::new(b"fpgm")) {
+        tt.insert("fontProgram".into(), lib_assembly(fpgm.as_bytes())?.into());
+    }
+    let maxp = font.maxp()?;
+    for (key, value) in [
+        ("maxFunctionDefs", maxp.max_function_defs()),
+        ("maxInstructionDefs", maxp.max_instruction_defs()),
+        ("maxStackElements", maxp.max_stack_elements()),
+        ("maxStorage", maxp.max_storage()),
+        ("maxTwilightPoints", maxp.max_twilight_points()),
+        ("maxZones", maxp.max_zones()),
+    ] {
+        let value = value.ok_or("'maxp' version 0.5 is not supported")?;
+        tt.insert(key.into(), value.into());
+    }
+    if let Some(prep) = font.table_data(Tag::new(b"prep")) {
+        tt.insert(
+            "controlValueProgram".into(),
+            lib_assembly(prep.as_bytes())?.into(),
+        );
+    }
+    Ok(tt)
 }
 
 /// What ufo-extractor stores in `public.truetype.instructions` for a program.

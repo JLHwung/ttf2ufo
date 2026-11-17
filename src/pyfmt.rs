@@ -92,6 +92,14 @@ impl Num {
             Num::Float(f) => float_repr(f),
         }
     }
+
+    /// Python's `f"{value:+}"`.
+    pub fn repr_signed(self) -> String {
+        match self {
+            Num::Int(i) => format!("{i:+}"),
+            Num::Float(f) => float_repr_signed(f),
+        }
+    }
 }
 
 /// Iteration order of a CPython `set` of non-negative ints built by adding

@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
+
 use super::model::{
     Attachment, FeatRef, FontFeatures, Ref, Routine, Rule, RuleKind, Slot, ValueRecord,
     sub_lookup_type,
@@ -230,17 +232,10 @@ fn bad_statement_to_comment(s: Stmt) -> Stmt {
 }
 
 /// `sortByAnchor`: group glyphs by anchor position, in first-seen order.
-fn sort_by_anchor(items: &[(String, (i32, i32))]) -> Vec<(Vec<String>, (i32, i32))> {
-    let mut groups: Vec<(Vec<String>, (i32, i32))> = Vec::new();
-    let mut index: HashMap<(i32, i32), usize> = HashMap::new();
+fn sort_by_anchor(items: &IndexMap<String, (i32, i32)>) -> IndexMap<(i32, i32), Vec<String>> {
+    let mut groups: IndexMap<(i32, i32), Vec<String>> = IndexMap::new();
     for (name, pos) in items {
-        match index.get(pos) {
-            Some(&i) => groups[i].0.push(name.clone()),
-            None => {
-                index.insert(*pos, groups.len());
-                groups.push((vec![name.clone()], *pos));
-            }
-        }
+        groups.entry(*pos).or_default().push(name.clone());
     }
     groups
 }
@@ -316,22 +311,20 @@ fn partition_routine(ff: &mut FontFeatures, rid: usize) -> Result<Option<Vec<usi
         return Ok(None);
     }
     let rules = std::mem::take(&mut ff.arena[rid].rules);
-    let mut groups: Vec<((&'static str, u32), Vec<Rule>)> = Vec::new();
+    // The routine without its rules, for the split-off copies.
+    let template = ff.arena[rid].clone();
+    let mut groups: IndexMap<(&'static str, u32), Vec<Rule>> = IndexMap::new();
     for rule in rules {
         let key = (rule.type_name(), rule.fea_lookup_type());
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, v)) => v.push(rule),
-            None => groups.push((key, vec![rule])),
-        }
+        groups.entry(key).or_default().push(rule);
     }
-    let mut groups = groups.into_iter();
-    let (_, first) = groups.next().unwrap();
-    ff.arena[rid].rules = first;
+    let mut groups = groups.into_values();
+    ff.arena[rid].rules = groups.next().unwrap();
     let mut all = vec![rid];
-    for (_, rules) in groups {
+    for rules in groups {
         let copy = Routine {
             rules,
-            ..ff.arena[rid].clone_without_rules()
+            ..template.clone()
         };
         all.push(ff.new_routine(copy));
     }
@@ -383,23 +376,6 @@ fn partition_routine(ff: &mut FontFeatures, rid: usize) -> Result<Option<Vec<usi
         }
     }
     Ok(Some(all))
-}
-
-impl Routine {
-    fn clone_without_rules(&self) -> Routine {
-        Routine {
-            name: self.name.clone(),
-            rules: Vec::new(),
-            flags: self.flags,
-            languages: self.languages.clone(),
-            mark_filtering_set: self.mark_filtering_set.clone(),
-            mark_attachment_set: self.mark_attachment_set.clone(),
-            usecount: self.usecount,
-            mark_filtering_set_as_class: self.mark_filtering_set_as_class.clone(),
-            mark_attachment_set_as_class: self.mark_attachment_set_as_class.clone(),
-            address: self.address.clone(),
-        }
-    }
 }
 
 /// `reorderAndResolve`
@@ -464,7 +440,7 @@ impl Writer<'_> {
             match &mut rule.kind {
                 RuleKind::Attachment(att) if !att.is_cursive() => {
                     let mut block = Vec::new();
-                    for (glyphs, pos) in sort_by_anchor(&att.marks.items) {
+                    for (pos, glyphs) in sort_by_anchor(&att.marks) {
                         let key = (att.fullname.clone(), glyphs.clone());
                         if !self.st.mark_classes_done.contains(&key) {
                             block.push(Stmt::Text(format!(
@@ -615,46 +591,27 @@ impl Writer<'_> {
                         _ => "pos",
                     };
                     // ChainContextSubstStatement / ChainContextPosStatement
-                    let mut res = format!("{verb} ");
-                    if !precontext.is_empty() {
-                        res += &join_refs(precontext);
-                        res += " ";
-                    }
+                    let mut marked = String::new();
                     for (i, g) in input.iter().enumerate() {
-                        res += &glyphref(g);
-                        res += "'";
+                        marked += &glyphref(g);
+                        marked += "'";
                         if let Some(Some(list)) = lookups.get(i) {
                             for lu in list {
-                                res += " lookup ";
-                                res += &lu.name;
+                                marked += " lookup ";
+                                marked += &lu.name;
                             }
                         }
                         if i + 1 < input.len() {
-                            res += " ";
+                            marked += " ";
                         }
                     }
-                    if !postcontext.is_empty() {
-                        res += " ";
-                        res += &join_refs(postcontext);
-                    }
-                    res += ";";
-                    Ok(Stmt::Text(res))
+                    let res = with_context(precontext, &marked, postcontext);
+                    Ok(Stmt::Text(format!("{verb} {res};")))
                 } else {
                     // IgnoreSubstStatement
-                    let mut res = String::new();
-                    if !precontext.is_empty() {
-                        res += &join_refs(precontext);
-                        res += " ";
-                    }
-                    res += &input
-                        .iter()
-                        .map(|g| format!("{}'", glyphref(g)))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !postcontext.is_empty() {
-                        res += " ";
-                        res += &join_refs(postcontext);
-                    }
+                    let marked: Vec<String> =
+                        input.iter().map(|g| format!("{}'", glyphref(g))).collect();
+                    let res = with_context(precontext, &marked.join(" "), postcontext);
                     Ok(Stmt::Text(format!("ignore sub {res};")))
                 }
             }
@@ -667,8 +624,8 @@ impl Writer<'_> {
         if att.is_cursive() {
             // Python iterates `set(bases) | set(marks)`, whose order depends
             // on PYTHONHASHSEED; entries then exits-only glyphs are used here.
-            let mut glyphs: Vec<&String> = att.bases.items.iter().map(|(g, _)| g).collect();
-            for (g, _) in &att.marks.items {
+            let mut glyphs: Vec<&String> = att.bases.keys().collect();
+            for g in att.marks.keys() {
                 if !att.bases.contains_key(g) {
                     glyphs.push(g);
                 }
@@ -692,7 +649,7 @@ impl Writer<'_> {
                 )));
             }
         } else {
-            for (glyphs, pos) in sort_by_anchor(&att.bases.items) {
+            for (pos, glyphs) in sort_by_anchor(&att.bases) {
                 let mut kind = "base";
                 if att.has_font && self.gdef.is_mark(&glyphs[0])? {
                     kind = "mark";
@@ -710,6 +667,22 @@ impl Writer<'_> {
         }
         Ok(Stmt::Block(block))
     }
+}
+
+/// The glyphs of a contextual statement: the precontext, the already
+/// rendered marked glyphs (`glyph'`), and the postcontext.
+fn with_context(precontext: &[Slot], marked: &str, postcontext: &[Slot]) -> String {
+    let mut res = String::new();
+    if !precontext.is_empty() {
+        res += &join_refs(precontext);
+        res += " ";
+    }
+    res += marked;
+    if !postcontext.is_empty() {
+        res += " ";
+        res += &join_refs(postcontext);
+    }
+    res
 }
 
 /// `LookupFlagStatement.asFea`
@@ -759,21 +732,8 @@ fn substitution_ast(rule: &Rule) -> Result<Stmt, Error> {
     // The "glyph(s)'" part of a statement, with context if any.
     let target = |glyphs: Vec<String>| -> String {
         if has_context {
-            let mut res = String::new();
-            if !precontext.is_empty() {
-                res += &join_refs(precontext);
-                res += " ";
-            }
-            res += &glyphs
-                .iter()
-                .map(|g| format!("{g}'"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !postcontext.is_empty() {
-                res += " ";
-                res += &join_refs(postcontext);
-            }
-            res
+            let marked: Vec<String> = glyphs.iter().map(|g| format!("{g}'")).collect();
+            with_context(precontext, &marked.join(" "), postcontext)
         } else {
             glyphs.join(" ")
         }
@@ -838,23 +798,17 @@ pub fn as_fea(ff: &mut FontFeatures, gdef: &GdefInfo) -> Result<String, Error> {
     let mut statements: Vec<Stmt> = Vec::new();
 
     // add_language_system_statements / hoist_languages
-    let mut scripts: Vec<(String, Vec<String>)> = Vec::new();
+    let mut scripts: IndexMap<String, Vec<String>> = IndexMap::new();
     let mut count = 0;
     for &rid in &ff.routines {
         for (script, lang) in &ff.arena[rid].languages {
-            let i = match scripts.iter().position(|(s, _)| s == script) {
-                Some(i) => i,
-                None => {
-                    scripts.push((script.clone(), Vec::new()));
-                    scripts.len() - 1
-                }
-            };
+            let langs = scripts.entry(script.clone()).or_default();
             if lang == "*" {
                 continue;
             }
-            if !scripts[i].1.contains(lang) {
+            if !langs.contains(lang) {
                 count += 1;
-                scripts[i].1.push(lang.clone());
+                langs.push(lang.clone());
             }
         }
     }
@@ -874,8 +828,8 @@ pub fn as_fea(ff: &mut FontFeatures, gdef: &GdefInfo) -> Result<String, Error> {
     // Partition routines by rule type.
     for fi in 0..ff.features.len() {
         let mut i = 0;
-        while i < ff.features[fi].1.len() {
-            let rid = ff.features[fi].1[i].routine;
+        while i < ff.features[fi].len() {
+            let rid = ff.features[fi][i].routine;
             if let Some(parts) = partition_routine(ff, rid)?
                 && !ff.arena[rid].name.is_empty()
                 && parts.len() > 1
@@ -898,7 +852,7 @@ pub fn as_fea(ff: &mut FontFeatures, gdef: &GdefInfo) -> Result<String, Error> {
     // Split references to routines with several languages.
     for fi in 0..ff.features.len() {
         let mut references = Vec::new();
-        for reference in &ff.features[fi].1 {
+        for reference in &ff.features[fi] {
             let langs = &ff.arena[reference.routine].languages;
             if langs.len() > 1 {
                 for l in langs {
@@ -914,7 +868,7 @@ pub fn as_fea(ff: &mut FontFeatures, gdef: &GdefInfo) -> Result<String, Error> {
                 });
             }
         }
-        ff.features[fi].1 = references;
+        ff.features[fi] = references;
     }
 
     let new_routines = reorder_and_resolve(ff)?;

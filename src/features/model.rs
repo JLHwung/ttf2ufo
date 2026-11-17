@@ -5,55 +5,7 @@
 //! arena (`FontFeatures::arena`) and `FontFeatures::routines` is the ordered
 //! list of arena indices that Python keeps in `ff.routines`.
 
-use std::collections::HashMap;
-use std::hash::Hash;
-
-/// An insertion-ordered dict with Python's semantics: re-assigning an
-/// existing key keeps its original position.
-#[derive(Clone, Debug)]
-pub struct ODict<K, V> {
-    pub items: Vec<(K, V)>,
-    index: HashMap<K, usize>,
-}
-
-impl<K: Clone + Eq + Hash, V> Default for ODict<K, V> {
-    fn default() -> Self {
-        ODict {
-            items: Vec::new(),
-            index: HashMap::new(),
-        }
-    }
-}
-
-impl<K: Clone + Eq + Hash, V> ODict<K, V> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, key: K, value: V) {
-        if let Some(&i) = self.index.get(&key) {
-            self.items[i].1 = value;
-        } else {
-            self.index.insert(key.clone(), self.items.len());
-            self.items.push((key, value));
-        }
-    }
-
-    pub fn get(&self, key: &K) -> Option<&V> {
-        self.index.get(key).map(|&i| &self.items[i].1)
-    }
-
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        match self.index.get(key) {
-            Some(&i) => Some(&mut self.items[i].1),
-            None => None,
-        }
-    }
-
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.index.contains_key(key)
-    }
-}
+use indexmap::IndexMap;
 
 /// One glyph-stream position: a list of glyph names.
 pub type Slot = Vec<String>;
@@ -100,11 +52,9 @@ impl ValueRecord {
 #[derive(Clone, Debug)]
 pub struct Attachment {
     pub base_name: String,
-    #[allow(dead_code)]
-    pub mark_name: String,
     pub fullname: String,
-    pub bases: ODict<String, (i32, i32)>,
-    pub marks: ODict<String, (i32, i32)>,
+    pub bases: IndexMap<String, (i32, i32)>,
+    pub marks: IndexMap<String, (i32, i32)>,
     /// Whether the rule was given `font=` (mark-to-base / mark-to-mark).
     pub has_font: bool,
     pub force_markmark: bool,
@@ -248,7 +198,7 @@ pub struct FontFeatures {
     /// `ff.routines`: arena indices, in order.
     pub routines: Vec<usize>,
     /// `ff.features`: feature tag -> references, in insertion order.
-    pub features: Vec<(String, Vec<FeatRef>)>,
+    pub features: IndexMap<String, Vec<FeatRef>>,
 }
 
 impl FontFeatures {
@@ -258,14 +208,7 @@ impl FontFeatures {
     }
 
     pub fn feature_mut(&mut self, tag: &str) -> &mut Vec<FeatRef> {
-        let i = match self.features.iter().position(|(t, _)| t == tag) {
-            Some(i) => i,
-            None => {
-                self.features.push((tag.to_string(), Vec::new()));
-                self.features.len() - 1
-            }
-        };
-        &mut self.features[i].1
+        self.features.entry(tag.to_string()).or_default()
     }
 
     /// `FontFeatures.resolveAllRoutines` / `RoutineReference.resolve`: give

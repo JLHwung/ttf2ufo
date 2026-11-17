@@ -2,15 +2,18 @@
 //! _extractOpenTypeKerningFromGPOS / _extractOpenTypeKerningFromKern) and mark
 //! anchors (extractAnchors).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::{IndexMap, IndexSet};
-use read_fonts::tables::gpos::{AnchorTable, Gpos, PairPos, PositionSubtables};
-use read_fonts::tables::layout::ClassDef;
+use read_fonts::tables::gpos::{
+    AnchorTable, Gpos, MarkBasePos, MarkMarkPos, PairPos, PositionLookup, PositionSubtables,
+};
 use read_fonts::types::Tag;
 use read_fonts::{FontRef, TableProvider};
 
 use crate::Error;
+use crate::names::GlyphOrder;
+use crate::otl::{MarkAttachment, class_defs, coverage_glyphs, tag_str};
 use crate::plist::{Dict, Value};
 use crate::pyfmt::{py_set_order, tuple_hash};
 use crate::ufo::Anchor;
@@ -27,22 +30,6 @@ enum Side {
 }
 
 type Pairs = IndexMap<(Side, Side), i64>;
-
-struct Names<'a>(&'a [String]);
-
-impl Names<'_> {
-    /// fontTools' getGlyphName: out-of-range ids get "glyph%05d".
-    fn get(&self, gid: u32) -> String {
-        self.0
-            .get(gid as usize)
-            .cloned()
-            .unwrap_or_else(|| format!("glyph{gid:05}"))
-    }
-}
-
-fn tag_str(tag: Tag) -> String {
-    String::from_utf8_lossy(&tag.to_be_bytes()).into_owned()
-}
 
 /// `_makeScriptOrder`: script tags, sorted.
 fn script_order(gpos: &Gpos) -> Result<Vec<String>, Error> {
@@ -70,32 +57,22 @@ fn gather_lookup_indexes(gpos: &Gpos, tags: &[&str]) -> Result<HashMap<String, V
     let mut result = HashMap::new();
     for record in script_list.script_records() {
         let script = record.script(script_list.offset_data())?;
-        let mut feature_sets: Vec<Vec<usize>> = Vec::new();
+        // the default LangSys, then each LangSys, in order
+        let mut lang_systems = Vec::new();
         if let Some(default) = script.default_lang_sys() {
-            let f: Vec<usize> = default?
-                .feature_indices()
-                .iter()
-                .map(|i| i.get() as usize)
-                .filter(|i| desired.contains(i))
-                .collect();
-            if !f.is_empty() {
-                feature_sets.push(f);
-            }
+            lang_systems.push(default?);
         }
         for lang in script.lang_sys_records() {
-            let lang_sys = lang.lang_sys(script.offset_data())?;
-            let f: Vec<usize> = lang_sys
-                .feature_indices()
+            lang_systems.push(lang.lang_sys(script.offset_data())?);
+        }
+        let features = lang_systems.iter().flat_map(|ls| {
+            ls.feature_indices()
                 .iter()
                 .map(|i| i.get() as usize)
                 .filter(|i| desired.contains(i))
-                .collect();
-            if !f.is_empty() {
-                feature_sets.push(f);
-            }
-        }
+        });
         let mut lookups = Vec::new();
-        for f in feature_sets.into_iter().flatten() {
+        for f in features {
             let feature = records[f].feature(feature_list.offset_data())?;
             for l in feature.lookup_list_indices() {
                 let l = l.get() as usize;
@@ -109,16 +86,30 @@ fn gather_lookup_indexes(gpos: &Gpos, tags: &[&str]) -> Result<HashMap<String, V
     Ok(result)
 }
 
-/// fontTools' ClassDef.classDefs: glyph -> class, class 0 omitted.
-fn class_defs(class_def: &ClassDef, names: &Names) -> IndexMap<String, u16> {
-    #[allow(clippy::unnecessary_cast)]
-    let mut defs = IndexMap::new();
-    for (gid, cls) in class_def.iter() {
-        if cls != 0 {
-            defs.insert(names.get(gid.to_u32()), cls as u16);
-        }
-    }
-    defs
+/// The lookups of the given features, script by script in `_makeScriptOrder`
+/// order, each lookup only the first time it is seen.
+fn lookups_by_script(gpos: &Gpos, tags: &[&str]) -> Result<Vec<Vec<usize>>, Error> {
+    let lookup_indexes = gather_lookup_indexes(gpos, tags)?;
+    let mut seen = HashSet::new();
+    Ok(script_order(gpos)?
+        .iter()
+        .map(|script| {
+            lookup_indexes
+                .get(script)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&index| seen.insert(index))
+                .collect()
+        })
+        .collect())
+}
+
+/// `gpos.LookupList.Lookup[index]`. extractor only reaches the LookupList
+/// through a referenced lookup, so a null LookupList is fine as long as no
+/// wanted feature uses one.
+fn gpos_lookup<'a>(gpos: &Gpos<'a>, index: usize) -> Result<PositionLookup<'a>, Error> {
+    Ok(gpos.lookup_list()?.lookups().get(index)?)
 }
 
 /// `_extractFeatureClasses`
@@ -154,8 +145,7 @@ fn feature_classes(
         .collect()
 }
 
-fn x_advance(record: &read_fonts::tables::gpos::ValueRecord, format_nonzero: bool) -> Option<i64> {
-    let _ = format_nonzero;
+fn x_advance(record: &read_fonts::tables::gpos::ValueRecord) -> Option<i64> {
     record.x_advance().map(|v| v as i64)
 }
 
@@ -164,7 +154,7 @@ fn x_advance(record: &read_fonts::tables::gpos::ValueRecord, format_nonzero: boo
 fn kerning_for_lookup(
     gpos: &Gpos,
     index: usize,
-    names: &Names,
+    names: &GlyphOrder,
 ) -> Result<
     Option<(
         Pairs,
@@ -173,7 +163,7 @@ fn kerning_for_lookup(
     )>,
     Error,
 > {
-    let lookup = gpos.lookup_list()?.lookups().get(index)?;
+    let lookup = gpos_lookup(gpos, index)?;
     if !matches!(lookup.lookup_type(), 2 | 9) {
         return Ok(None);
     }
@@ -186,11 +176,7 @@ fn kerning_for_lookup(
     for (si, subtable) in subtables.iter().enumerate() {
         match subtable? {
             PairPos::Format1(t) => {
-                let coverage: Vec<String> = t
-                    .coverage()?
-                    .iter()
-                    .map(|g| names.get(g.to_u32()))
-                    .collect();
+                let coverage = coverage_glyphs(names, &t.coverage()?)?;
                 let use_first = !t.value_format1().is_empty();
                 if t.pair_sets().len() < coverage.len() {
                     // `pairSets[index]` for every coverage glyph: IndexError
@@ -207,8 +193,8 @@ fn kerning_for_lookup(
                         } else {
                             record.value_record2()
                         };
-                        if let Some(v) = x_advance(value, use_first) {
-                            let right_name = names.get(record.second_glyph().to_u32());
+                        if let Some(v) = x_advance(value) {
+                            let right_name = names.name(record.second_glyph().to_u32());
                             kerning.insert(
                                 (Side::Glyph(left_name.clone()), Side::Glyph(right_name)),
                                 v,
@@ -218,18 +204,14 @@ fn kerning_for_lookup(
                 }
             }
             PairPos::Format2(t) => {
-                let coverage: Vec<String> = t
-                    .coverage()?
-                    .iter()
-                    .map(|g| names.get(g.to_u32()))
-                    .collect();
+                let coverage = coverage_glyphs(names, &t.coverage()?)?;
                 let l = feature_classes(
                     index,
                     si,
-                    &class_defs(&t.class_def1()?, names),
+                    &class_defs(names, &t.class_def1()?)?,
                     Some(&coverage),
                 );
-                let r = feature_classes(index, si, &class_defs(&t.class_def2()?, names), None);
+                let r = feature_classes(index, si, &class_defs(names, &t.class_def2()?)?, None);
                 let use_first = !t.value_format1().is_empty();
                 for (c1, class1) in t.class1_records().iter().enumerate() {
                     let class1 = class1?;
@@ -240,7 +222,7 @@ fn kerning_for_lookup(
                         } else {
                             class2.value_record2()
                         };
-                        if let Some(v) = x_advance(value, use_first).filter(|v| *v != 0) {
+                        if let Some(v) = x_advance(value).filter(|v| *v != 0) {
                             kerning.insert(
                                 (Side::Class((index, si, c1)), Side::Class((index, si, c2))),
                                 v,
@@ -354,27 +336,17 @@ fn side_name(side: &Side) -> Result<String, Error> {
 }
 
 /// (kerning.plist, groups.plist) contents.
-pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, Dict), Error> {
-    let names = Names(glyph_names);
+pub fn extract_kerning(font: &FontRef, names: &GlyphOrder) -> Result<(Dict, Dict), Error> {
     let mut kerning = Pairs::new();
     let mut groups = Dict::new();
     if let Ok(gpos) = font.gpos() {
-        let lookup_indexes = gather_lookup_indexes(&gpos, &["kern"])?;
-        let mut seen = std::collections::HashSet::new();
         let mut kerning_dicts: Vec<Vec<Pairs>> = Vec::new();
         let mut left_dicts: Vec<Vec<IndexMap<ClassId, Members>>> = Vec::new();
         let mut right_dicts: Vec<Vec<IndexMap<ClassId, Members>>> = Vec::new();
-        for script in script_order(&gpos)? {
+        for lookups in lookups_by_script(&gpos, &["kern"])? {
             let (mut k, mut l, mut r) = (Vec::new(), Vec::new(), Vec::new());
-            for &index in lookup_indexes
-                .get(&script)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-            {
-                if !seen.insert(index) {
-                    continue;
-                }
-                if let Some((pairs, lc, rc)) = kerning_for_lookup(&gpos, index, &names)? {
+            for index in lookups {
+                if let Some((pairs, lc, rc)) = kerning_for_lookup(&gpos, index, names)? {
                     k.push(pairs);
                     l.push(lc);
                     r.push(rc);
@@ -435,7 +407,7 @@ pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, 
     if kerning.is_empty()
         && let Some(data) = font.table_data(Tag::new(b"kern"))
     {
-        kerning = kern_table(data.as_bytes(), &names)?;
+        kerning = kern_table(data.as_bytes(), names)?;
         groups = Dict::new();
     }
 
@@ -453,7 +425,7 @@ pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, 
 /// `_extractOpenTypeKerningFromKern`, over fontTools' `kern` decompile: the
 /// OpenType (version 0) and Apple (version 1.0) layouts. Every subtable must
 /// be format 0: other formats have no `version`, so extractor fails on them.
-fn kern_table(d: &[u8], names: &Names) -> Result<Pairs, Error> {
+fn kern_table(d: &[u8], names: &GlyphOrder) -> Result<Pairs, Error> {
     fn be(d: &[u8], at: usize, n: usize) -> Result<u64, Error> {
         let bytes = d.get(at..at + n).ok_or("bad 'kern' table")?;
         Ok(bytes.iter().fold(0u64, |v, b| v << 8 | *b as u64))
@@ -502,8 +474,8 @@ fn kern_table(d: &[u8], names: &Names) -> Result<Pairs, Error> {
             let value = be(body, p + 4, 2)? as u16 as i16 as i64;
             pairs.insert(
                 (
-                    Side::Glyph(names.get(be(body, p, 2)? as u32)),
-                    Side::Glyph(names.get(be(body, p + 2, 2)? as u32)),
+                    Side::Glyph(names.name(be(body, p, 2)? as u32)),
+                    Side::Glyph(names.name(be(body, p + 2, 2)? as u32)),
                 ),
                 value,
             );
@@ -514,13 +486,10 @@ fn kern_table(d: &[u8], names: &Names) -> Result<Pairs, Error> {
 }
 
 fn anchor_xy(anchor: &AnchorTable) -> (i64, i64) {
-    match anchor {
-        AnchorTable::Format1(a) => (a.x_coordinate() as i64, a.y_coordinate() as i64),
-        AnchorTable::Format2(a) => (a.x_coordinate() as i64, a.y_coordinate() as i64),
-        AnchorTable::Format3(a) => (a.x_coordinate() as i64, a.y_coordinate() as i64),
-    }
+    (anchor.x_coordinate() as i64, anchor.y_coordinate() as i64)
 }
 
+/// Per anchor group: (base glyph -> position, mark glyph -> position).
 type AnchorGroup = (IndexMap<String, (i64, i64)>, IndexMap<String, (i64, i64)>);
 
 fn grow(groups: &mut Vec<AnchorGroup>, len: usize) {
@@ -529,134 +498,76 @@ fn grow(groups: &mut Vec<AnchorGroup>, len: usize) {
     }
 }
 
+/// The anchor groups of one mark-to-base or mark-to-mark subtable, one per
+/// base anchor index and mark class.
+fn anchor_groups(t: &MarkAttachment, names: &GlyphOrder) -> Result<Vec<AnchorGroup>, Error> {
+    let base_cov = coverage_glyphs(names, &t.base_coverage)?;
+    let mark_cov = coverage_glyphs(names, &t.mark_coverage)?;
+    let mut groups: Vec<AnchorGroup> = Vec::new();
+    for (ri, row) in t.base_anchors.iter().enumerate() {
+        for (ai, anchor) in row.iter().enumerate() {
+            grow(&mut groups, ai + 1);
+            if let Some(anchor) = anchor {
+                let glyph = base_cov.get(ri).ok_or("base coverage too short")?;
+                groups[ai]
+                    .0
+                    .insert(glyph.clone(), anchor_xy(&anchor.clone()?));
+            }
+        }
+    }
+    for (mi, record) in t.marks.mark_records().iter().enumerate() {
+        let class = record.mark_class() as usize;
+        grow(&mut groups, class + 1);
+        let anchor = record.mark_anchor(t.marks.offset_data())?;
+        if let AnchorTable::Format1(_) = anchor {
+            let glyph = mark_cov.get(mi).ok_or("mark coverage too short")?;
+            groups[class].1.insert(glyph.clone(), anchor_xy(&anchor));
+        } else {
+            eprintln!("  Unexpected markAnchor format.");
+        }
+    }
+    Ok(groups)
+}
+
 /// `extractAnchors`: glyph name -> anchors to append, in order.
 pub fn extract_anchors(
     font: &FontRef,
-    glyph_names: &[String],
+    names: &GlyphOrder,
 ) -> Result<IndexMap<String, Vec<Anchor>>, Error> {
-    let names = Names(glyph_names);
     let mut out: IndexMap<String, Vec<Anchor>> = IndexMap::new();
     let Ok(gpos) = font.gpos() else {
         return Ok(out);
     };
-    let lookup_indexes = gather_lookup_indexes(&gpos, &["mark", "mkmk"])?;
-    // extractor only reaches the LookupList through a referenced lookup, so
-    // a null LookupList is fine when no mark/mkmk feature uses one.
-    let mut seen = std::collections::HashSet::new();
     let mut all: Vec<AnchorGroup> = Vec::new();
-    for script in script_order(&gpos)? {
-        for &index in lookup_indexes
-            .get(&script)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            if !seen.insert(index) {
-                continue;
-            }
-            let lookup = gpos.lookup_list()?.lookups().get(index)?;
-            if !matches!(lookup.lookup_type(), 4 | 6 | 9) {
-                continue;
-            }
-            match lookup.subtables()? {
-                PositionSubtables::MarkToBase(subtables) => {
-                    for subtable in subtables.iter() {
-                        let read_fonts::tables::gpos::MarkBasePos::Format1(t) = subtable? else {
-                            eprintln!("  Skipping Anchor lookup subtable of unknown format.");
-                            continue;
-                        };
-                        let mut groups: Vec<AnchorGroup> = Vec::new();
-                        let base_cov: Vec<String> = t
-                            .base_coverage()?
-                            .iter()
-                            .map(|g| names.get(g.to_u32()))
-                            .collect();
-                        let mark_cov: Vec<String> = t
-                            .mark_coverage()?
-                            .iter()
-                            .map(|g| names.get(g.to_u32()))
-                            .collect();
-                        let base_array = t.base_array()?;
-                        for (ri, record) in base_array.base_records().iter().enumerate() {
-                            let record = record?;
-                            for (ai, anchor) in record
-                                .base_anchors(base_array.offset_data())
-                                .iter()
-                                .enumerate()
-                            {
-                                grow(&mut groups, ai + 1);
-                                if let Some(anchor) = anchor {
-                                    groups[ai]
-                                        .0
-                                        .insert(base_cov[ri].clone(), anchor_xy(&anchor?));
-                                }
-                            }
-                        }
-                        let mark_array = t.mark_array()?;
-                        for (mi, record) in mark_array.mark_records().iter().enumerate() {
-                            let class = record.mark_class() as usize;
-                            grow(&mut groups, class + 1);
-                            let anchor = record.mark_anchor(mark_array.offset_data())?;
-                            if let AnchorTable::Format1(_) = anchor {
-                                groups[class]
-                                    .1
-                                    .insert(mark_cov[mi].clone(), anchor_xy(&anchor));
-                            } else {
-                                eprintln!("  Unexpected markAnchor format.");
-                            }
-                        }
-                        all.extend(groups);
-                    }
-                }
-                PositionSubtables::MarkToMark(subtables) => {
-                    for subtable in subtables.iter() {
-                        let read_fonts::tables::gpos::MarkMarkPos::Format1(t) = subtable? else {
-                            eprintln!("  Skipping Anchor lookup subtable of unknown format.");
-                            continue;
-                        };
-                        let mut groups: Vec<AnchorGroup> = Vec::new();
-                        let base_cov: Vec<String> = t
-                            .mark2_coverage()?
-                            .iter()
-                            .map(|g| names.get(g.to_u32()))
-                            .collect();
-                        let mark_cov: Vec<String> = t
-                            .mark1_coverage()?
-                            .iter()
-                            .map(|g| names.get(g.to_u32()))
-                            .collect();
-                        let base_array = t.mark2_array()?;
-                        for (ri, record) in base_array.mark2_records().iter().enumerate() {
-                            let record = record?;
-                            for (ai, anchor) in record
-                                .mark2_anchors(base_array.offset_data())
-                                .iter()
-                                .enumerate()
-                            {
-                                grow(&mut groups, ai + 1);
-                                if let Some(anchor) = anchor {
-                                    groups[ai]
-                                        .0
-                                        .insert(base_cov[ri].clone(), anchor_xy(&anchor?));
-                                }
-                            }
-                        }
-                        let mark_array = t.mark1_array()?;
-                        for (mi, record) in mark_array.mark_records().iter().enumerate() {
-                            let class = record.mark_class() as usize;
-                            grow(&mut groups, class + 1);
-                            let anchor = record.mark_anchor(mark_array.offset_data())?;
-                            if let AnchorTable::Format1(_) = anchor {
-                                groups[class]
-                                    .1
-                                    .insert(mark_cov[mi].clone(), anchor_xy(&anchor));
-                            } else {
-                                eprintln!("  Unexpected markAnchor format.");
-                            }
-                        }
-                        all.extend(groups);
-                    }
-                }
-                _ => {}
+    for index in lookups_by_script(&gpos, &["mark", "mkmk"])?
+        .into_iter()
+        .flatten()
+    {
+        let lookup = gpos_lookup(&gpos, index)?;
+        if !matches!(lookup.lookup_type(), 4 | 6 | 9) {
+            continue;
+        }
+        let subtables = match lookup.subtables()? {
+            PositionSubtables::MarkToBase(subtables) => subtables
+                .iter()
+                .map(|t| match t? {
+                    MarkBasePos::Format1(t) => Ok(Some(MarkAttachment::mark_to_base(&t)?)),
+                    _ => Ok(None),
+                })
+                .collect::<Result<Vec<_>, Error>>()?,
+            PositionSubtables::MarkToMark(subtables) => subtables
+                .iter()
+                .map(|t| match t? {
+                    MarkMarkPos::Format1(t) => Ok(Some(MarkAttachment::mark_to_mark(&t)?)),
+                    _ => Ok(None),
+                })
+                .collect::<Result<Vec<_>, Error>>()?,
+            _ => Vec::new(),
+        };
+        for subtable in subtables {
+            match subtable {
+                Some(t) => all.extend(anchor_groups(&t, names)?),
+                None => eprintln!("  Skipping Anchor lookup subtable of unknown format."),
             }
         }
     }

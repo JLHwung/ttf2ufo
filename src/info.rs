@@ -178,9 +178,9 @@ fn version_string(x: f64) -> String {
 pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
     let mut info = Dict::new();
     let mut lib = Dict::new();
-    let set = |info: &mut Dict, key: &str, value: Value| {
-        info.insert(key.to_string(), value);
-    };
+    fn set(info: &mut Dict, key: &str, value: impl Into<Value>) {
+        info.insert(key.to_string(), value.into());
+    }
 
     // head
     let head = font.head()?;
@@ -189,32 +189,22 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
     set(&mut info, "versionMajor", Value::Int(major.parse()?));
     let minor: i64 = minor.parse()?;
     if minor >= 0 {
-        set(&mut info, "versionMinor", Value::Int(minor));
+        set(&mut info, "versionMinor", minor);
     }
-    set(
-        &mut info,
-        "unitsPerEm",
-        Value::Int(head.units_per_em() as i64),
-    );
+    set(&mut info, "unitsPerEm", head.units_per_em());
     set(
         &mut info,
         "openTypeHeadCreated",
-        format_date(head.created().as_secs()).into(),
+        format_date(head.created().as_secs()),
     );
     set(
         &mut info,
         "openTypeHeadLowestRecPPEM",
-        Value::Int(head.lowest_rec_ppem() as i64),
+        head.lowest_rec_ppem(),
     );
     // The raw field: read-fonts' `head.flags()` drops the bits it doesn't
     // define (5-10), which fontTools keeps.
-    let raw_flags = u16::from_be_bytes(
-        head.offset_data()
-            .as_bytes()
-            .get(16..18)
-            .ok_or("bad 'head' table")?
-            .try_into()?,
-    );
+    let raw_flags: u16 = head.offset_data().read_at(head.flags_byte_range().start)?;
     let flags = bits(raw_flags as u64, 0);
     if flags.iter().all(|b| *b <= 14) {
         set(&mut info, "openTypeHeadFlags", int_list(&flags));
@@ -226,7 +216,7 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
         (false, true) => "italic",
         _ => "regular",
     };
-    set(&mut info, "styleMapStyleName", style.into());
+    set(&mut info, "styleMapStyleName", style);
 
     // name
     let name = font.name()?;
@@ -275,7 +265,7 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
             (id, None, None, None),
         ]
     };
-    let attributes: [(&str, Vec<u16>); 23] = [
+    let attributes: [(&str, Vec<u16>); 21] = [
         ("familyName", vec![16, 1]),
         ("styleName", vec![17, 2]),
         ("styleMapFamilyName", vec![1]),
@@ -297,13 +287,11 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
         ("openTypeNameSampleText", vec![20]),
         ("openTypeNameWWSFamilyName", vec![21]),
         ("openTypeNameWWSSubfamilyName", vec![22]),
-        ("", vec![]),
-        ("", vec![]),
     ];
-    for (attr, ids) in attributes.iter().filter(|(a, _)| !a.is_empty()) {
+    for (attr, ids) in &attributes {
         let priority: Vec<_> = ids.iter().flat_map(|id| prio(*id)).collect();
         if let Some(v) = skim(&priority) {
-            set(&mut info, attr, v.into());
+            set(&mut info, attr, v);
         }
     }
     records.sort();
@@ -319,10 +307,10 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
         .into_iter()
         .map(|(nid, pid, eid, lid, s)| {
             let mut d = Dict::new();
-            d.insert("nameID".into(), Value::Int(nid as i64));
-            d.insert("platformID".into(), Value::Int(pid as i64));
-            d.insert("encodingID".into(), Value::Int(eid as i64));
-            d.insert("languageID".into(), Value::Int(lid as i64));
+            d.insert("nameID".into(), nid.into());
+            d.insert("platformID".into(), pid.into());
+            d.insert("encodingID".into(), eid.into());
+            d.insert("languageID".into(), lid.into());
             d.insert("string".into(), s.into());
             Value::Dict(d)
         })
@@ -330,171 +318,115 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
     set(&mut info, "openTypeNameRecords", Value::Array(name_records));
 
     // OS/2
-    if let Ok(os2) = font.os2() {
-        let width = os2.us_width_class() as i64;
-        if (1..=9).contains(&width) {
-            set(&mut info, "openTypeOS2WidthClass", Value::Int(width));
-        }
-        set(
-            &mut info,
-            "openTypeOS2WeightClass",
-            Value::Int(os2.us_weight_class() as i64),
-        );
-        let selection: Vec<i64> = bits(os2.fs_selection().bits() as u64, 0)
-            .into_iter()
-            .filter(|b| (1..=4).contains(b))
-            .collect();
-        set(&mut info, "openTypeOS2Selection", int_list(&selection));
-        let vendor_bytes = os2.ach_vend_id().to_be_bytes();
-        if !vendor_bytes.is_ascii() {
-            return Err("non-ASCII OS/2 vendor IDs are not supported".into());
-        }
-        let vendor: String = vendor_bytes.iter().map(|&b| b as char).collect();
-        set(
-            &mut info,
-            "openTypeOS2VendorID",
-            vendor.trim_end_matches('\0').to_string().into(),
-        );
-        let p = os2.panose_10();
-        set(
-            &mut info,
-            "openTypeOS2Panose",
-            int_list(&p.iter().map(|v| *v as i64).collect::<Vec<_>>()),
-        );
-        let ranges = bits(os2.ul_unicode_range_1() as u64, 0)
-            .into_iter()
-            .chain(bits(os2.ul_unicode_range_2() as u64, 32))
-            .chain(bits(os2.ul_unicode_range_3() as u64, 64))
-            .chain(bits(os2.ul_unicode_range_4() as u64, 96))
-            .collect::<Vec<_>>();
-        set(&mut info, "openTypeOS2UnicodeRanges", int_list(&ranges));
-        if let (Some(c1), Some(c2)) = (os2.ul_code_page_range_1(), os2.ul_code_page_range_2()) {
-            let pages = bits(c1 as u64, 0)
-                .into_iter()
-                .chain(bits(c2 as u64, 32))
-                .collect::<Vec<_>>();
-            set(&mut info, "openTypeOS2CodePageRanges", int_list(&pages));
-        }
-        if let Some(v) = os2.sx_height() {
-            set(&mut info, "xHeight", Value::Int(v as i64));
-        }
-        if let Some(v) = os2.s_cap_height() {
-            set(&mut info, "capHeight", Value::Int(v as i64));
-        }
-        let typo_asc = os2.s_typo_ascender() as i64;
-        let typo_desc = os2.s_typo_descender() as i64;
-        set(&mut info, "ascender", Value::Int(typo_asc));
-        set(&mut info, "descender", Value::Int(typo_desc));
-        set(&mut info, "openTypeOS2TypoAscender", Value::Int(typo_asc));
-        set(&mut info, "openTypeOS2TypoDescender", Value::Int(typo_desc));
-        set(
-            &mut info,
-            "openTypeOS2TypoLineGap",
-            Value::Int(os2.s_typo_line_gap() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeOS2WinAscent",
-            Value::Int(os2.us_win_ascent() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeOS2WinDescent",
-            Value::Int(os2.us_win_descent() as i64),
-        );
-        let fs_type = bits(os2.fs_type() as u64, 0);
-        if fs_type.iter().all(|b| matches!(b, 0 | 1 | 2 | 3 | 8 | 9)) {
-            set(&mut info, "openTypeOS2Type", int_list(&fs_type));
-        }
-        for (key, v) in [
-            ("openTypeOS2SubscriptXSize", os2.y_subscript_x_size()),
-            ("openTypeOS2SubscriptYSize", os2.y_subscript_y_size()),
-            ("openTypeOS2SubscriptXOffset", os2.y_subscript_x_offset()),
-            ("openTypeOS2SubscriptYOffset", os2.y_subscript_y_offset()),
-            ("openTypeOS2SuperscriptXSize", os2.y_superscript_x_size()),
-            ("openTypeOS2SuperscriptYSize", os2.y_superscript_y_size()),
-            (
-                "openTypeOS2SuperscriptXOffset",
-                os2.y_superscript_x_offset(),
-            ),
-            (
-                "openTypeOS2SuperscriptYOffset",
-                os2.y_superscript_y_offset(),
-            ),
-            ("openTypeOS2StrikeoutSize", os2.y_strikeout_size()),
-            ("openTypeOS2StrikeoutPosition", os2.y_strikeout_position()),
-        ] {
-            set(&mut info, key, Value::Int(v as i64));
-        }
-    } else {
+    let Ok(os2) = font.os2() else {
         return Err("fonts without an 'OS/2' table are not supported".into());
+    };
+    let width = os2.us_width_class() as i64;
+    if (1..=9).contains(&width) {
+        set(&mut info, "openTypeOS2WidthClass", width);
+    }
+    set(&mut info, "openTypeOS2WeightClass", os2.us_weight_class());
+    let selection: Vec<i64> = bits(os2.fs_selection().bits() as u64, 0)
+        .into_iter()
+        .filter(|b| (1..=4).contains(b))
+        .collect();
+    set(&mut info, "openTypeOS2Selection", int_list(&selection));
+    let vendor_bytes = os2.ach_vend_id().to_be_bytes();
+    if !vendor_bytes.is_ascii() {
+        return Err("non-ASCII OS/2 vendor IDs are not supported".into());
+    }
+    let vendor: String = vendor_bytes.iter().map(|&b| b as char).collect();
+    set(
+        &mut info,
+        "openTypeOS2VendorID",
+        vendor.trim_end_matches('\0').to_string(),
+    );
+    let p = os2.panose_10();
+    set(
+        &mut info,
+        "openTypeOS2Panose",
+        int_list(&p.iter().map(|v| *v as i64).collect::<Vec<_>>()),
+    );
+    let ranges = bits(os2.ul_unicode_range_1() as u64, 0)
+        .into_iter()
+        .chain(bits(os2.ul_unicode_range_2() as u64, 32))
+        .chain(bits(os2.ul_unicode_range_3() as u64, 64))
+        .chain(bits(os2.ul_unicode_range_4() as u64, 96))
+        .collect::<Vec<_>>();
+    set(&mut info, "openTypeOS2UnicodeRanges", int_list(&ranges));
+    if let (Some(c1), Some(c2)) = (os2.ul_code_page_range_1(), os2.ul_code_page_range_2()) {
+        let pages = bits(c1 as u64, 0)
+            .into_iter()
+            .chain(bits(c2 as u64, 32))
+            .collect::<Vec<_>>();
+        set(&mut info, "openTypeOS2CodePageRanges", int_list(&pages));
+    }
+    if let Some(v) = os2.sx_height() {
+        set(&mut info, "xHeight", v);
+    }
+    if let Some(v) = os2.s_cap_height() {
+        set(&mut info, "capHeight", v);
+    }
+    for (key, v) in [
+        ("ascender", os2.s_typo_ascender()),
+        ("descender", os2.s_typo_descender()),
+        ("openTypeOS2TypoAscender", os2.s_typo_ascender()),
+        ("openTypeOS2TypoDescender", os2.s_typo_descender()),
+        ("openTypeOS2TypoLineGap", os2.s_typo_line_gap()),
+    ] {
+        set(&mut info, key, v);
+    }
+    set(&mut info, "openTypeOS2WinAscent", os2.us_win_ascent());
+    set(&mut info, "openTypeOS2WinDescent", os2.us_win_descent());
+    let fs_type = bits(os2.fs_type() as u64, 0);
+    if fs_type.iter().all(|b| matches!(b, 0 | 1 | 2 | 3 | 8 | 9)) {
+        set(&mut info, "openTypeOS2Type", int_list(&fs_type));
+    }
+    for (key, v) in [
+        ("openTypeOS2SubscriptXSize", os2.y_subscript_x_size()),
+        ("openTypeOS2SubscriptYSize", os2.y_subscript_y_size()),
+        ("openTypeOS2SubscriptXOffset", os2.y_subscript_x_offset()),
+        ("openTypeOS2SubscriptYOffset", os2.y_subscript_y_offset()),
+        ("openTypeOS2SuperscriptXSize", os2.y_superscript_x_size()),
+        ("openTypeOS2SuperscriptYSize", os2.y_superscript_y_size()),
+        (
+            "openTypeOS2SuperscriptXOffset",
+            os2.y_superscript_x_offset(),
+        ),
+        (
+            "openTypeOS2SuperscriptYOffset",
+            os2.y_superscript_y_offset(),
+        ),
+        ("openTypeOS2StrikeoutSize", os2.y_strikeout_size()),
+        ("openTypeOS2StrikeoutPosition", os2.y_strikeout_position()),
+    ] {
+        set(&mut info, key, v);
     }
 
-    // hhea
+    // hhea, vhea
     if let Ok(hhea) = font.hhea() {
-        set(
-            &mut info,
-            "openTypeHheaAscender",
-            Value::Int(hhea.ascender().to_i16() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeHheaDescender",
-            Value::Int(hhea.descender().to_i16() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeHheaLineGap",
-            Value::Int(hhea.line_gap().to_i16() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeHheaCaretSlopeRise",
-            Value::Int(hhea.caret_slope_rise() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeHheaCaretSlopeRun",
-            Value::Int(hhea.caret_slope_run() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeHheaCaretOffset",
-            Value::Int(hhea.caret_offset() as i64),
-        );
+        for (key, v) in [
+            ("openTypeHheaAscender", hhea.ascender().to_i16()),
+            ("openTypeHheaDescender", hhea.descender().to_i16()),
+            ("openTypeHheaLineGap", hhea.line_gap().to_i16()),
+            ("openTypeHheaCaretSlopeRise", hhea.caret_slope_rise()),
+            ("openTypeHheaCaretSlopeRun", hhea.caret_slope_run()),
+            ("openTypeHheaCaretOffset", hhea.caret_offset()),
+        ] {
+            set(&mut info, key, v);
+        }
     }
-    // vhea
     if let Ok(vhea) = font.vhea() {
-        set(
-            &mut info,
-            "openTypeVheaVertTypoAscender",
-            Value::Int(vhea.ascender().to_i16() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeVheaVertTypoDescender",
-            Value::Int(vhea.descender().to_i16() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeVheaVertTypoLineGap",
-            Value::Int(vhea.line_gap().to_i16() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeVheaCaretSlopeRise",
-            Value::Int(vhea.caret_slope_rise() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeVheaCaretSlopeRun",
-            Value::Int(vhea.caret_slope_run() as i64),
-        );
-        set(
-            &mut info,
-            "openTypeVheaCaretOffset",
-            Value::Int(vhea.caret_offset() as i64),
-        );
+        for (key, v) in [
+            ("openTypeVheaVertTypoAscender", vhea.ascender().to_i16()),
+            ("openTypeVheaVertTypoDescender", vhea.descender().to_i16()),
+            ("openTypeVheaVertTypoLineGap", vhea.line_gap().to_i16()),
+            ("openTypeVheaCaretSlopeRise", vhea.caret_slope_rise()),
+            ("openTypeVheaCaretSlopeRun", vhea.caret_slope_run()),
+            ("openTypeVheaCaretOffset", vhea.caret_offset()),
+        ] {
+            set(&mut info, key, v);
+        }
     }
     // post
     let post = font.post()?;
@@ -506,12 +438,12 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
     set(
         &mut info,
         "postscriptUnderlineThickness",
-        Value::Int(post.underline_thickness().to_i16() as i64),
+        post.underline_thickness().to_i16(),
     );
     set(
         &mut info,
         "postscriptUnderlinePosition",
-        Value::Int(post.underline_position().to_i16() as i64),
+        post.underline_position().to_i16(),
     );
     set(
         &mut info,
@@ -536,17 +468,13 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
         if d.len() > 4 + 4 * n {
             return Err("too much data in 'gasp' table".into());
         }
-        let mut ranges: Vec<(i64, u16)> = (0..n)
+        // fontTools keeps a dict (last record per size wins), then sorts
+        let by_size: std::collections::BTreeMap<i64, u16> = (0..n)
             .map(|i| -> Result<(i64, u16), Error> {
                 let at = 4 + 4 * i;
                 Ok((u16_at(at)? as i64, u16_at(at + 2)?))
             })
             .collect::<Result<_, _>>()?;
-        // fontTools keeps a dict (last record per size wins), then sorts
-        let mut by_size = std::collections::BTreeMap::new();
-        for (size, behavior) in ranges.drain(..) {
-            by_size.insert(size, behavior);
-        }
         let records: Vec<Value> = by_size
             .into_iter()
             .map(|(size, b)| {
@@ -569,7 +497,7 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
     );
     lib.insert(
         "public.openTypePostUnderlinePosition".into(),
-        Value::Int(post.underline_position().to_i16() as i64),
+        post.underline_position().to_i16().into(),
     );
     if font.table_data(Tag::new(b"CFF ")).is_some() {
         return Err("CFF-flavored fonts are not supported".into());

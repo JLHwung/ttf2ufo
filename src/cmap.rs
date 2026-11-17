@@ -1,10 +1,12 @@
 //! Character mappings, as fontTools decodes the `cmap` table.
 
 use indexmap::IndexMap;
-use read_fonts::tables::cmap::{Cmap, CmapSubtable, PlatformId};
+use read_fonts::tables::cmap::{Cmap, Cmap14, CmapSubtable, PlatformId};
 use read_fonts::{FontRef, TableProvider};
 
 use crate::Error;
+use crate::names::GlyphOrder;
+use crate::plist::{Dict, Value};
 use crate::pyfmt::int_set_order;
 
 /// One decoded subtable: fontTools' `subtable.cmap` dict, code -> glyph id,
@@ -14,13 +16,47 @@ struct Subtable {
     platform: u16,
     encoding: u16,
     map: IndexMap<u32, u32>,
+    /// A format 14 subtable's variation sequences.
+    uvs: Option<Vec<UvsRecord>>,
+}
+
+/// `CmapSubtable.isUnicode()`
+fn is_unicode(platform: u16, encoding: u16) -> bool {
+    platform == 0 || (platform == 3 && matches!(encoding, 0 | 1 | 10))
 }
 
 impl Subtable {
-    /// `CmapSubtable.isUnicode()`
     fn is_unicode(&self) -> bool {
-        self.platform == 0 || (self.platform == 3 && matches!(self.encoding, 0 | 1 | 10))
+        is_unicode(self.platform, self.encoding)
     }
+}
+
+/// A format 14 subtable's records: variation selector -> base characters
+/// with their glyph, `None` for the default UVS.
+fn uvs_records(t: &Cmap14) -> Result<Vec<UvsRecord>, Error> {
+    let data = t.offset_data();
+    let mut uvs = Vec::new();
+    for selector in t.var_selector() {
+        let mut entries = Vec::new();
+        if let Some(default) = selector.default_uvs(data) {
+            for range in default?.ranges() {
+                let first = range.start_unicode_value().to_u32();
+                for uv in first..=first + range.additional_count() as u32 {
+                    entries.push((uv, None));
+                }
+            }
+        }
+        if let Some(non_default) = selector.non_default_uvs(data) {
+            for mapping in non_default?.uvs_mapping() {
+                entries.push((
+                    mapping.unicode_value().to_u32(),
+                    Some(mapping.glyph_id() as u32),
+                ));
+            }
+        }
+        uvs.push((selector.var_selector().to_u32(), entries));
+    }
+    Ok(uvs)
 }
 
 fn insert(map: &mut IndexMap<u32, u32>, code: u32, gid: u32) {
@@ -42,6 +78,7 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
         };
         let encoding = record.encoding_id();
         let mut map = IndexMap::new();
+        let mut uvs = None;
         match cmap.subtable(i as u16)? {
             CmapSubtable::Format0(t) => {
                 for (code, gid) in t.glyph_id_array().iter().enumerate() {
@@ -105,10 +142,9 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
                     }
                 }
             }
-            CmapSubtable::Format14(_) => {}
+            CmapSubtable::Format14(t) => uvs = Some(uvs_records(&t)?),
             other => {
-                let unicode = platform == 0 || (platform == 3 && matches!(encoding, 0 | 1 | 10));
-                if unicode {
+                if is_unicode(platform, encoding) {
                     return Err(format!(
                         "cmap subtable format {} is not supported",
                         format_of(&other)
@@ -121,6 +157,7 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
             platform,
             encoding,
             map,
+            uvs,
         });
     }
     Ok(out)
@@ -174,6 +211,33 @@ pub struct CharMap {
     pub uvs: Vec<UvsRecord>,
 }
 
+impl CharMap {
+    /// The `public.unicodeVariationSequences` lib entry: variation selector
+    /// -> base character -> glyph name, or `None` without format 14 data.
+    pub fn uvs_lib(&self, names: &GlyphOrder) -> Result<Option<Value>, Error> {
+        if self.uvs.is_empty() {
+            return Ok(None);
+        }
+        let mut sequences = Dict::new();
+        for (selector, entries) in &self.uvs {
+            let mut map = Dict::new();
+            for (base, glyph) in entries {
+                let gid = match glyph {
+                    Some(gid) => *gid,
+                    None => *self
+                        .best
+                        .as_ref()
+                        .and_then(|best| best.get(base))
+                        .ok_or_else(|| format!("default UVS U+{base:04X} has no cmap entry"))?,
+                };
+                map.insert(format!("{base:04X}"), names.name(gid).into());
+            }
+            sequences.insert(format!("{selector:04X}"), Value::Dict(map));
+        }
+        Ok(Some(Value::Dict(sequences)))
+    }
+}
+
 /// Read the `cmap` table. A font without one has no code points and no
 /// variation sequences.
 pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
@@ -218,36 +282,14 @@ pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
             .map(|t| t.map.clone())
     });
 
-    let mut uvs = Vec::new();
-    for (i, record) in cmap.encoding_records().iter().enumerate() {
-        let _ = record;
-        if let CmapSubtable::Format14(t) = cmap.subtable(i as u16)? {
-            // extractor assigns the lib key once per format 14 subtable: the
-            // last one wins
-            uvs.clear();
-            let data = t.offset_data();
-            for selector in t.var_selector() {
-                let mut entries = Vec::new();
-                if let Some(default) = selector.default_uvs(data) {
-                    for range in default?.ranges() {
-                        let first = range.start_unicode_value().to_u32();
-                        for uv in first..=first + range.additional_count() as u32 {
-                            entries.push((uv, None));
-                        }
-                    }
-                }
-                if let Some(non_default) = selector.non_default_uvs(data) {
-                    for mapping in non_default?.uvs_mapping() {
-                        entries.push((
-                            mapping.unicode_value().to_u32(),
-                            Some(mapping.glyph_id() as u32),
-                        ));
-                    }
-                }
-                uvs.push((selector.var_selector().to_u32(), entries));
-            }
-        }
-    }
+    // extractor assigns the lib key once per format 14 subtable: the last
+    // one wins
+    let uvs = subtables
+        .iter()
+        .filter_map(|t| t.uvs.as_ref())
+        .next_back()
+        .cloned()
+        .unwrap_or_default();
     Ok(CharMap {
         unicodes,
         best,

@@ -75,6 +75,17 @@ impl From<i64> for Value {
         Value::Int(v)
     }
 }
+macro_rules! from_small_int {
+    ($($t:ty),*) => {$(
+        impl From<$t> for Value {
+            fn from(v: $t) -> Self {
+                Value::Int(v as i64)
+            }
+        }
+    )*};
+}
+from_small_int!(u8, i16, u16);
+
 impl From<i32> for Value {
     fn from(v: i32) -> Self {
         Value::Int(v as i64)

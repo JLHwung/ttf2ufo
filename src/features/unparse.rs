@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use indexmap::IndexMap;
 use read_fonts::ReadError;
 use read_fonts::tables::gpos::{
     AnchorTable, CursivePos, Gpos, MarkBasePos, MarkLigPos, MarkMarkPos, PairPos, PositionLookup,
@@ -13,30 +14,22 @@ use read_fonts::tables::gsub::{
     SubstitutionLookup, SubstitutionSubtables,
 };
 use read_fonts::tables::layout::{
-    ChainedSequenceContext, FeatureList, LangSys, ScriptList, SequenceContext, SequenceLookupRecord,
+    ChainedSequenceContext, ClassDef, CoverageTable, FeatureList, LangSys, ScriptList,
+    SequenceContext, SequenceLookupRecord,
 };
-use read_fonts::types::Tag;
+use read_fonts::types::{BigEndian, GlyphId16};
 
 use super::model::{
-    Attachment, FeatRef, FontFeatures, ODict, Ref, Routine, Rule, RuleKind, Slot, ValueRecord,
+    Attachment, FeatRef, FontFeatures, Ref, Routine, Rule, RuleKind, Slot, ValueRecord,
 };
-use super::tables::{
-    GdefInfo, GlyphNames, class_defs, coverage_glyphs, invert_class_def, opt_coverage_glyphs,
-    read_err,
-};
+use super::tables::{GdefInfo, invert_class_def};
 use crate::Error;
+use crate::names::GlyphOrder;
+use crate::otl::{MarkAttachment, class_defs, coverage_gids, coverage_glyphs, tag_str};
 
-macro_rules! collect {
-    ($iter:expr) => {
-        $iter
-            .collect::<Result<Vec<_>, ReadError>>()
-            .map_err(read_err)?
-    };
-}
-
-/// fontTools reads tags as Latin-1 strings.
-pub fn tag_str(tag: Tag) -> String {
-    tag.to_be_bytes().iter().map(|&b| b as char).collect()
+/// Collects an iterator of read results, failing on the first error.
+fn all<T>(items: impl Iterator<Item = Result<T, ReadError>>) -> Result<Vec<T>, ReadError> {
+    items.collect()
 }
 
 fn single(g: String) -> Slot {
@@ -65,7 +58,7 @@ fn py_int_list(v: &[u16]) -> String {
 
 pub struct Unparser<'a> {
     pub ff: &'a mut FontFeatures,
-    pub names: &'a GlyphNames,
+    pub names: &'a GlyphOrder,
     pub gdef: &'a GdefInfo,
     /// `_table`: "GSUB" or "GPOS".
     pub table: &'static str,
@@ -74,13 +67,18 @@ pub struct Unparser<'a> {
     index: usize,
     /// Arena indices of this table's routines, by lookup index.
     lookups: Vec<usize>,
+    /// The lookup being unparsed: its index, flag, mark filtering set, and
+    /// whether it is an extension lookup.
     current_lookup: usize,
+    flag: u16,
+    mark_filtering_set: Option<u16>,
+    is_ext: bool,
 }
 
 impl<'a> Unparser<'a> {
     pub fn new(
         ff: &'a mut FontFeatures,
-        names: &'a GlyphNames,
+        names: &'a GlyphOrder,
         gdef: &'a GdefInfo,
         table: &'static str,
         debg: Option<&'a Result<serde_json::Value, String>>,
@@ -94,6 +92,9 @@ impl<'a> Unparser<'a> {
             index: 0,
             lookups: Vec::new(),
             current_lookup: 0,
+            flag: 0,
+            mark_filtering_set: None,
+            is_ext: false,
         }
     }
 
@@ -106,8 +107,16 @@ impl<'a> Unparser<'a> {
         self.names.name(gid)
     }
 
-    /// `_fix_flags`: a routine with the lookup's flags and mark sets.
-    fn routine(&self, name: String, flag: u16, mfs: Option<u16>) -> Result<Routine, Error> {
+    /// A routine named `prefix` plus the next symbol, with the current
+    /// lookup's flags and mark sets.
+    fn start(&mut self, prefix: &str) -> Result<Routine, Error> {
+        let name = format!("{prefix}{}", self.gensym());
+        self.routine(name)
+    }
+
+    /// `_fix_flags`: a routine with the current lookup's flags and mark sets.
+    fn routine(&self, name: String) -> Result<Routine, Error> {
+        let flag = self.flag;
         let mut r = Routine {
             name,
             flags: flag,
@@ -122,15 +131,14 @@ impl<'a> Unparser<'a> {
                 .map_err(|e| Error::from(e.clone()))?;
             let wanted = mat >> 8;
             r.mark_attachment_set = Some(
-                defs.items
-                    .iter()
-                    .filter(|(_, c)| *c == wanted)
+                defs.iter()
+                    .filter(|(_, c)| **c == wanted)
                     .map(|(g, _)| g.clone())
                     .collect(),
             );
         }
         if flag & 0x10 != 0 {
-            if let Some(idx) = mfs {
+            if let Some(idx) = self.mark_filtering_set {
                 let sets = self
                     .gdef
                     .mark_glyph_sets
@@ -155,6 +163,45 @@ impl<'a> Unparser<'a> {
         }
     }
 
+    /// A substitution rule without context.
+    fn subst(&self, input: Vec<Slot>, replacement: Vec<Slot>, force_alt: bool) -> Rule {
+        self.rule(RuleKind::Substitution {
+            input,
+            replacement,
+            precontext: vec![],
+            postcontext: vec![],
+            reverse: false,
+            force_alt,
+        })
+    }
+
+    fn glyph_names(&self, gids: &[BigEndian<GlyphId16>]) -> Vec<String> {
+        gids.iter().map(|g| self.name(g.get().to_u32())).collect()
+    }
+
+    fn names_of(&self, gids: &[BigEndian<GlyphId16>]) -> Vec<Slot> {
+        self.glyph_names(gids).into_iter().map(single).collect()
+    }
+
+    /// One slot per coverage table.
+    fn coverage_slots<'b>(
+        &self,
+        covs: impl Iterator<Item = Result<CoverageTable<'b>, ReadError>>,
+    ) -> Result<Vec<Slot>, Error> {
+        all(covs)?
+            .iter()
+            .map(|cov| coverage_glyphs(self.names, cov))
+            .collect()
+    }
+
+    /// `_invertClassDef(classDef.classDefs)`
+    fn classes(
+        &self,
+        cd: Result<ClassDef, ReadError>,
+    ) -> Result<IndexMap<u16, Vec<String>>, Error> {
+        Ok(invert_class_def(self.names, &class_defs(self.names, &cd?)?))
+    }
+
     // ------------------------------------------------------------------
     // Table level
     // ------------------------------------------------------------------
@@ -164,21 +211,13 @@ impl<'a> Unparser<'a> {
         let Some(script_list) = gsub.original_script_list() else {
             return Ok(());
         };
-        let script_list = script_list.map_err(read_err)?;
+        let script_list = script_list?;
         if let Some(lookup_list) = gsub.original_lookup_list() {
-            let lookup_list = lookup_list.map_err(read_err)?;
-            let lookups: Vec<SubstitutionLookup> = collect!(lookup_list.lookups().iter());
-            self.make_dummies(lookups.len());
-            for (idx, lookup) in lookups.iter().enumerate() {
-                let mut routine = self.unparse_gsub_lookup(lookup, idx)?;
-                self.apply_debug_info(&mut routine, idx)?;
-                self.copy_routine(routine, idx);
-            }
+            let lookup_list = lookup_list?;
+            let lookups = all(lookup_list.lookups().iter())?;
+            self.unparse_lookup_list(&lookups, Self::unparse_gsub_lookup)?;
         }
-        let feature_list = gsub.original_feature_list();
-        self.collect_features(&script_list, feature_list)?;
-        self.ff.resolve_all_routines();
-        Ok(())
+        self.collect_features(&script_list, gsub.original_feature_list())
     }
 
     /// `GTableUnparser.unparse` for GPOS.
@@ -186,20 +225,28 @@ impl<'a> Unparser<'a> {
         let Some(script_list) = gpos.original_script_list() else {
             return Ok(());
         };
-        let script_list = script_list.map_err(read_err)?;
+        let script_list = script_list?;
         if let Some(lookup_list) = gpos.original_lookup_list() {
-            let lookup_list = lookup_list.map_err(read_err)?;
-            let lookups: Vec<PositionLookup> = collect!(lookup_list.lookups().iter());
-            self.make_dummies(lookups.len());
-            for (idx, lookup) in lookups.iter().enumerate() {
-                let mut routine = self.unparse_gpos_lookup(lookup, idx)?;
-                self.apply_debug_info(&mut routine, idx)?;
-                self.copy_routine(routine, idx);
-            }
+            let lookup_list = lookup_list?;
+            let lookups = all(lookup_list.lookups().iter())?;
+            self.unparse_lookup_list(&lookups, Self::unparse_gpos_lookup)?;
         }
-        let feature_list = gpos.original_feature_list();
-        self.collect_features(&script_list, feature_list)?;
-        self.ff.resolve_all_routines();
+        self.collect_features(&script_list, gpos.original_feature_list())
+    }
+
+    /// `unparseLookups`
+    fn unparse_lookup_list<L>(
+        &mut self,
+        lookups: &[L],
+        unparse: fn(&mut Self, &L) -> Result<Routine, Error>,
+    ) -> Result<(), Error> {
+        self.make_dummies(lookups.len());
+        for (idx, lookup) in lookups.iter().enumerate() {
+            self.current_lookup = idx;
+            let mut routine = unparse(self, lookup)?;
+            self.apply_debug_info(&mut routine, idx)?;
+            self.copy_routine(routine, idx);
+        }
         Ok(())
     }
 
@@ -274,23 +321,21 @@ impl<'a> Unparser<'a> {
         script_list: &ScriptList,
         feature_list: Option<Result<FeatureList, ReadError>>,
     ) -> Result<(), Error> {
-        let feature_list = match feature_list {
-            None => None,
-            Some(fl) => Some(fl.map_err(read_err)?),
-        };
+        let feature_list = feature_list.transpose()?;
         for record in script_list.script_records() {
             let script_tag = tag_str(record.script_tag());
-            let script = record.script(script_list.offset_data()).map_err(read_err)?;
+            let script = record.script(script_list.offset_data())?;
             if let Some(dls) = script.default_lang_sys() {
-                let dls = dls.map_err(read_err)?;
+                let dls = dls?;
                 self.prepare_feature_lang_sys("dflt", &dls, feature_list.as_ref(), &script_tag)?;
             }
             for lsr in script.lang_sys_records() {
                 let lang_tag = tag_str(lsr.lang_sys_tag());
-                let ls = lsr.lang_sys(script.offset_data()).map_err(read_err)?;
+                let ls = lsr.lang_sys(script.offset_data())?;
                 self.prepare_feature_lang_sys(&lang_tag, &ls, feature_list.as_ref(), &script_tag)?;
             }
         }
+        self.ff.resolve_all_routines();
         Ok(())
     }
 
@@ -309,9 +354,7 @@ impl<'a> Unparser<'a> {
                 .get(fi)
                 .ok_or("feature index out of range")?;
             let feature_tag = tag_str(record.feature_tag());
-            let feature = record
-                .feature(feature_list.offset_data())
-                .map_err(read_err)?;
+            let feature = record.feature(feature_list.offset_data())?;
             for li in feature.lookup_list_indices() {
                 let li = li.get() as usize;
                 let routine = *self.lookups.get(li).ok_or("lookup index out of range")?;
@@ -340,123 +383,60 @@ impl<'a> Unparser<'a> {
     /// Runs `f` on the subtables, or for an extension lookup, on each
     /// subtable separately and wraps the results into an "Extension" routine
     /// (`unparseExtension`).
-    #[allow(clippy::type_complexity)]
     fn run<T>(
         &mut self,
-        is_ext: bool,
-        subtables: Vec<T>,
-        flag: u16,
-        mfs: Option<u16>,
-        f: fn(&mut Self, Vec<T>, u16, Option<u16>) -> Result<Routine, Error>,
+        subtables: impl Iterator<Item = Result<T, ReadError>>,
+        f: fn(&mut Self, Vec<T>) -> Result<Routine, Error>,
     ) -> Result<Routine, Error> {
-        if !is_ext {
-            return f(self, subtables, flag, mfs);
+        let subtables = all(subtables)?;
+        if !self.is_ext {
+            return f(self, subtables);
         }
         let mut rules = Vec::new();
         for sub in subtables {
-            let r = f(self, vec![sub], flag, mfs)?;
-            rules.extend(r.rules);
+            rules.extend(f(self, vec![sub])?.rules);
         }
-        self.extension(rules, flag, mfs)
+        self.extension(rules)
     }
 
-    fn extension(
-        &mut self,
-        rules: Vec<Rule>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("Extension{}", self.gensym());
-        let mut r = self.routine(name, flag, mfs)?;
+    fn extension(&mut self, rules: Vec<Rule>) -> Result<Routine, Error> {
+        let mut r = self.start("Extension")?;
         r.rules = rules;
         Ok(r)
     }
 
-    fn unparse_gsub_lookup(
-        &mut self,
-        lookup: &SubstitutionLookup,
-        idx: usize,
-    ) -> Result<Routine, Error> {
-        self.current_lookup = idx;
-        let flag = lookup.lookup_flag().to_bits();
-        let mfs = lookup.mark_filtering_set();
-        let is_ext = lookup.lookup_type() == 7;
-        match lookup.subtables().map_err(read_err)? {
-            SubstitutionSubtables::Single(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::single_subst)
-            }
-            SubstitutionSubtables::Multiple(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::multiple_subst)
-            }
-            SubstitutionSubtables::Alternate(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::alternate_subst)
-            }
-            SubstitutionSubtables::Ligature(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::ligature_subst)
-            }
-            SubstitutionSubtables::Contextual(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::contextual)
-            }
+    fn unparse_gsub_lookup(&mut self, lookup: &SubstitutionLookup) -> Result<Routine, Error> {
+        self.flag = lookup.lookup_flag().to_bits();
+        self.mark_filtering_set = lookup.mark_filtering_set();
+        self.is_ext = lookup.lookup_type() == 7;
+        match lookup.subtables()? {
+            SubstitutionSubtables::Single(s) => self.run(s.iter(), Self::single_subst),
+            SubstitutionSubtables::Multiple(s) => self.run(s.iter(), Self::multiple_subst),
+            SubstitutionSubtables::Alternate(s) => self.run(s.iter(), Self::alternate_subst),
+            SubstitutionSubtables::Ligature(s) => self.run(s.iter(), Self::ligature_subst),
+            SubstitutionSubtables::Contextual(s) => self.run(s.iter(), Self::contextual),
             SubstitutionSubtables::ChainContextual(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::chained_contextual)
+                self.run(s.iter(), Self::chained_contextual)
             }
-            SubstitutionSubtables::Reverse(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::reverse_subst)
-            }
-            SubstitutionSubtables::EmptyExtension => self.extension(Vec::new(), flag, mfs),
+            SubstitutionSubtables::Reverse(s) => self.run(s.iter(), Self::reverse_subst),
+            SubstitutionSubtables::EmptyExtension => self.extension(Vec::new()),
         }
     }
 
-    fn unparse_gpos_lookup(
-        &mut self,
-        lookup: &PositionLookup,
-        idx: usize,
-    ) -> Result<Routine, Error> {
-        self.current_lookup = idx;
-        let flag = lookup.lookup_flag().to_bits();
-        let mfs = lookup.mark_filtering_set();
-        let is_ext = lookup.lookup_type() == 9;
-        match lookup.subtables().map_err(read_err)? {
-            PositionSubtables::Single(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::single_pos)
-            }
-            PositionSubtables::Pair(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::pair_pos)
-            }
-            PositionSubtables::Cursive(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::cursive_pos)
-            }
-            PositionSubtables::MarkToBase(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::mark_to_base)
-            }
-            PositionSubtables::MarkToLig(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::mark_to_ligature)
-            }
-            PositionSubtables::MarkToMark(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::mark_to_mark)
-            }
-            PositionSubtables::Contextual(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::contextual)
-            }
-            PositionSubtables::ChainContextual(s) => {
-                let v = collect!(s.iter());
-                self.run(is_ext, v, flag, mfs, Self::chained_contextual)
-            }
-            PositionSubtables::EmptyExtension => self.extension(Vec::new(), flag, mfs),
+    fn unparse_gpos_lookup(&mut self, lookup: &PositionLookup) -> Result<Routine, Error> {
+        self.flag = lookup.lookup_flag().to_bits();
+        self.mark_filtering_set = lookup.mark_filtering_set();
+        self.is_ext = lookup.lookup_type() == 9;
+        match lookup.subtables()? {
+            PositionSubtables::Single(s) => self.run(s.iter(), Self::single_pos),
+            PositionSubtables::Pair(s) => self.run(s.iter(), Self::pair_pos),
+            PositionSubtables::Cursive(s) => self.run(s.iter(), Self::cursive_pos),
+            PositionSubtables::MarkToBase(s) => self.run(s.iter(), Self::mark_to_base),
+            PositionSubtables::MarkToLig(s) => self.run(s.iter(), Self::mark_to_ligature),
+            PositionSubtables::MarkToMark(s) => self.run(s.iter(), Self::mark_to_mark),
+            PositionSubtables::Contextual(s) => self.run(s.iter(), Self::contextual),
+            PositionSubtables::ChainContextual(s) => self.run(s.iter(), Self::chained_contextual),
+            PositionSubtables::EmptyExtension => self.extension(Vec::new()),
         }
     }
 
@@ -464,19 +444,13 @@ impl<'a> Unparser<'a> {
     // GSUB
     // ------------------------------------------------------------------
 
-    fn single_subst(
-        &mut self,
-        subs: Vec<SingleSubst>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("SingleSubstitution{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn single_subst(&mut self, subs: Vec<SingleSubst>) -> Result<Routine, Error> {
+        let mut b = self.start("SingleSubstitution")?;
         for sub in subs {
-            let mut mapping: ODict<String, String> = ODict::new();
+            let mut mapping: IndexMap<String, String> = IndexMap::new();
             match &sub {
                 SingleSubst::Format1(t) => {
-                    let cov = t.coverage().map_err(read_err)?;
+                    let cov = t.coverage()?;
                     let input = coverage_glyphs(self.names, &cov)?;
                     let gids = coverage_gids(&cov)?;
                     let delta = t.delta_glyph_id() as i32;
@@ -486,7 +460,7 @@ impl<'a> Unparser<'a> {
                     }
                 }
                 SingleSubst::Format2(t) => {
-                    let input = opt_coverage_glyphs(self.names, t.coverage())?;
+                    let input = coverage_glyphs(self.names, &t.coverage()?)?;
                     if input.len() != t.glyph_count() as usize {
                         return Err("invalid SingleSubstFormat2 table".into());
                     }
@@ -496,178 +470,106 @@ impl<'a> Unparser<'a> {
                 }
                 _ => return Err("unsupported SingleSubst format".into()),
             }
-            for (k, v) in mapping.items {
-                let kind = RuleKind::Substitution {
-                    input: vec![single(k)],
-                    replacement: vec![single(v)],
-                    precontext: vec![],
-                    postcontext: vec![],
-                    reverse: false,
-                    force_alt: false,
-                };
-                b.rules.push(self.rule(kind));
+            for (k, v) in mapping {
+                b.rules
+                    .push(self.subst(vec![single(k)], vec![single(v)], false));
             }
         }
         Ok(b)
     }
 
-    fn multiple_subst(
-        &mut self,
-        subs: Vec<MultipleSubst>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("MultipleSubstitution{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn multiple_subst(&mut self, subs: Vec<MultipleSubst>) -> Result<Routine, Error> {
+        let mut b = self.start("MultipleSubstitution")?;
         for sub in subs {
             let MultipleSubst::Format1(t) = &sub else {
                 return Err("unsupported MultipleSubst format".into());
             };
-            let glyphs = opt_coverage_glyphs(self.names, t.coverage())?;
-            let seqs = collect!(t.sequences().iter());
-            let mut mapping: ODict<String, Vec<String>> = ODict::new();
+            let glyphs = coverage_glyphs(self.names, &t.coverage()?)?;
+            let seqs = all(t.sequences().iter())?;
+            let mut mapping: IndexMap<String, Vec<String>> = IndexMap::new();
             for (g, seq) in glyphs.into_iter().zip(seqs) {
-                let out = seq
-                    .substitute_glyph_ids()
-                    .iter()
-                    .map(|x| self.name(x.get().to_u32()))
-                    .collect();
+                let out = self.glyph_names(seq.substitute_glyph_ids());
                 mapping.insert(g, out);
             }
-            for (k, outs) in mapping.items {
-                let kind = RuleKind::Substitution {
-                    input: vec![single(k)],
-                    replacement: outs.into_iter().map(single).collect(),
-                    precontext: vec![],
-                    postcontext: vec![],
-                    reverse: false,
-                    force_alt: false,
-                };
-                b.rules.push(self.rule(kind));
+            for (k, outs) in mapping {
+                b.rules.push(self.subst(
+                    vec![single(k)],
+                    outs.into_iter().map(single).collect(),
+                    false,
+                ));
             }
         }
         Ok(b)
     }
 
-    fn alternate_subst(
-        &mut self,
-        subs: Vec<AlternateSubst>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("AlternateSubstitution{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn alternate_subst(&mut self, subs: Vec<AlternateSubst>) -> Result<Routine, Error> {
+        let mut b = self.start("AlternateSubstitution")?;
         for sub in subs {
             let AlternateSubst::Format1(t) = &sub else {
                 return Err("unsupported AlternateSubst format".into());
             };
-            let input = opt_coverage_glyphs(self.names, t.coverage())?;
-            let sets = collect!(t.alternate_sets().iter());
+            let input = coverage_glyphs(self.names, &t.coverage()?)?;
+            let sets = all(t.alternate_sets().iter())?;
             if input.len() != sets.len() {
                 return Err("AlternateSubst coverage and AlternateSet counts differ".into());
             }
-            let mut alternates: ODict<String, Vec<String>> = ODict::new();
+            let mut alternates: IndexMap<String, Vec<String>> = IndexMap::new();
             for (g, set) in input.into_iter().zip(sets) {
-                let alts = set
-                    .alternate_glyph_ids()
-                    .iter()
-                    .map(|x| self.name(x.get().to_u32()))
-                    .collect();
+                let alts = self.glyph_names(set.alternate_glyph_ids());
                 alternates.insert(g, alts);
             }
-            for (k, alts) in alternates.items {
-                let kind = RuleKind::Substitution {
-                    input: vec![single(k)],
-                    replacement: vec![alts],
-                    precontext: vec![],
-                    postcontext: vec![],
-                    reverse: false,
-                    force_alt: true,
-                };
-                b.rules.push(self.rule(kind));
+            for (k, alts) in alternates {
+                b.rules.push(self.subst(vec![single(k)], vec![alts], true));
             }
         }
         Ok(b)
     }
 
-    fn ligature_subst(
-        &mut self,
-        subs: Vec<LigatureSubst>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("LigatureSubstitution{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn ligature_subst(&mut self, subs: Vec<LigatureSubst>) -> Result<Routine, Error> {
+        let mut b = self.start("LigatureSubstitution")?;
         for sub in subs {
             let LigatureSubst::Format1(t) = &sub else {
                 return Err("unsupported LigatureSubst format".into());
             };
-            let input = opt_coverage_glyphs(self.names, t.coverage())?;
-            let sets = collect!(t.ligature_sets().iter());
+            let input = coverage_glyphs(self.names, &t.coverage()?)?;
+            let sets = all(t.ligature_sets().iter())?;
             if input.len() != sets.len() {
                 return Err("LigatureSubst coverage and LigatureSet counts differ".into());
             }
-            let mut ligatures: ODict<String, Vec<(Vec<String>, String)>> = ODict::new();
+            let mut ligatures: IndexMap<String, Vec<(Vec<String>, String)>> = IndexMap::new();
             for (g, set) in input.into_iter().zip(sets) {
-                let ligs = collect!(set.ligatures().iter());
+                let ligs = all(set.ligatures().iter())?;
                 let ligs = ligs
                     .iter()
                     .map(|lig| {
-                        let comps = lig
-                            .component_glyph_ids()
-                            .iter()
-                            .map(|x| self.name(x.get().to_u32()))
-                            .collect();
+                        let comps = self.glyph_names(lig.component_glyph_ids());
                         (comps, self.name(lig.ligature_glyph().to_u32()))
                     })
                     .collect();
                 ligatures.insert(g, ligs);
             }
-            for (first, ligs) in ligatures.items {
+            for (first, ligs) in ligatures {
                 for (comps, lig) in ligs {
                     let mut input = vec![single(first.clone())];
                     input.extend(comps.into_iter().map(single));
-                    let kind = RuleKind::Substitution {
-                        input,
-                        replacement: vec![single(lig)],
-                        precontext: vec![],
-                        postcontext: vec![],
-                        reverse: false,
-                        force_alt: false,
-                    };
-                    b.rules.push(self.rule(kind));
+                    b.rules.push(self.subst(input, vec![single(lig)], false));
                 }
             }
         }
         Ok(b)
     }
 
-    fn reverse_subst(
-        &mut self,
-        subs: Vec<ReverseChainSingleSubst>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("ReverseContextualSubstitution{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn reverse_subst(&mut self, subs: Vec<ReverseChainSingleSubst>) -> Result<Routine, Error> {
+        let mut b = self.start("ReverseContextualSubstitution")?;
         for sub in subs {
             let ReverseChainSingleSubst::Format1(t) = &sub else {
                 return Err("unsupported ReverseChainSingleSubst format".into());
             };
-            let mut prefix = Vec::new();
-            for cov in collect!(t.backtrack_coverages().iter()).iter().rev() {
-                prefix.push(coverage_glyphs(self.names, cov)?);
-            }
-            let mut suffix = Vec::new();
-            for cov in collect!(t.lookahead_coverages().iter()).iter() {
-                suffix.push(coverage_glyphs(self.names, cov)?);
-            }
-            let outputs: Vec<String> = t
-                .substitute_glyph_ids()
-                .iter()
-                .map(|x| self.name(x.get().to_u32()))
-                .collect();
-            let inputs = opt_coverage_glyphs(self.names, t.coverage())?;
+            let mut prefix = self.coverage_slots(t.backtrack_coverages().iter())?;
+            prefix.reverse();
+            let suffix = self.coverage_slots(t.lookahead_coverages().iter())?;
+            let outputs: Vec<String> = self.glyph_names(t.substitute_glyph_ids());
+            let inputs = coverage_glyphs(self.names, &t.coverage()?)?;
             let kind = RuleKind::Substitution {
                 input: vec![inputs],
                 replacement: vec![outputs],
@@ -689,18 +591,12 @@ impl<'a> Unparser<'a> {
     // GPOS
     // ------------------------------------------------------------------
 
-    fn single_pos(
-        &mut self,
-        subs: Vec<SinglePos>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("SinglePositioning{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn single_pos(&mut self, subs: Vec<SinglePos>) -> Result<Routine, Error> {
+        let mut b = self.start("SinglePositioning")?;
         for sub in subs {
             match &sub {
                 SinglePos::Format1(t) => {
-                    let glyphs = opt_coverage_glyphs(self.names, t.coverage())?;
+                    let glyphs = coverage_glyphs(self.names, &t.coverage()?)?;
                     let kind = RuleKind::Positioning {
                         glyphs: vec![glyphs],
                         valuerecords: vec![value_record(&t.value_record())],
@@ -708,8 +604,8 @@ impl<'a> Unparser<'a> {
                     b.rules.push(self.rule(kind));
                 }
                 SinglePos::Format2(t) => {
-                    let glyphs = opt_coverage_glyphs(self.names, t.coverage())?;
-                    let values = collect!(t.value_records().iter());
+                    let glyphs = coverage_glyphs(self.names, &t.coverage()?)?;
+                    let values = all(t.value_records().iter())?;
                     for (g, v) in glyphs.into_iter().zip(values.iter()) {
                         let kind = RuleKind::Positioning {
                             glyphs: vec![single(g)],
@@ -724,21 +620,15 @@ impl<'a> Unparser<'a> {
         Ok(b)
     }
 
-    fn pair_pos(
-        &mut self,
-        subs: Vec<PairPos>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("PairPositioning{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn pair_pos(&mut self, subs: Vec<PairPos>) -> Result<Routine, Error> {
+        let mut b = self.start("PairPositioning")?;
         for sub in subs {
             match &sub {
                 PairPos::Format1(t) => {
-                    let glyphs = opt_coverage_glyphs(self.names, t.coverage())?;
-                    let sets = collect!(t.pair_sets().iter());
+                    let glyphs = coverage_glyphs(self.names, &t.coverage()?)?;
+                    let sets = all(t.pair_sets().iter())?;
                     for (g, set) in glyphs.into_iter().zip(sets) {
-                        for vr in collect!(set.pair_value_records().iter()) {
+                        for vr in all(set.pair_value_records().iter())? {
                             let second = self.name(vr.second_glyph().to_u32());
                             let kind = RuleKind::Positioning {
                                 glyphs: vec![single(g.clone()), single(second)],
@@ -752,20 +642,18 @@ impl<'a> Unparser<'a> {
                     }
                 }
                 PairPos::Format2(t) => {
-                    let cd1 = class_defs(self.names, &t.class_def1().map_err(read_err)?)?;
-                    let cd2 = class_defs(self.names, &t.class_def2().map_err(read_err)?)?;
-                    let class1 = invert_class_def(self.names, &cd1);
-                    let class2 = invert_class_def(self.names, &cd2);
-                    let coverage: HashSet<String> = opt_coverage_glyphs(self.names, t.coverage())?
+                    let class1 = self.classes(t.class_def1())?;
+                    let class2 = self.classes(t.class_def2())?;
+                    let coverage: HashSet<String> = coverage_glyphs(self.names, &t.coverage()?)?
                         .into_iter()
                         .collect();
                     for (ix1, c1) in t.class1_records().iter().enumerate() {
-                        let c1 = c1.map_err(read_err)?;
+                        let c1 = c1?;
                         let Some(first_all) = class1.get(&(ix1 as u16)) else {
                             continue;
                         };
                         for (ix2, c2) in c1.class2_records().iter().enumerate() {
-                            let c2 = c2.map_err(read_err)?;
+                            let c2 = c2?;
                             let Some(second) = class2.get(&(ix2 as u16)) else {
                                 continue;
                             };
@@ -803,33 +691,26 @@ impl<'a> Unparser<'a> {
         Ok(b)
     }
 
-    fn cursive_pos(
-        &mut self,
-        subs: Vec<CursivePos>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("CursiveAttachment{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
-        let mut entries: ODict<String, (i32, i32)> = ODict::new();
-        let mut exits: ODict<String, (i32, i32)> = ODict::new();
+    fn cursive_pos(&mut self, subs: Vec<CursivePos>) -> Result<Routine, Error> {
+        let mut b = self.start("CursiveAttachment")?;
+        let mut entries: IndexMap<String, (i32, i32)> = IndexMap::new();
+        let mut exits: IndexMap<String, (i32, i32)> = IndexMap::new();
         for sub in subs {
             let CursivePos::Format1(t) = &sub else {
                 return Err("unsupported CursivePos format".into());
             };
-            let glyphs = opt_coverage_glyphs(self.names, t.coverage())?;
+            let glyphs = coverage_glyphs(self.names, &t.coverage()?)?;
             for (g, rec) in glyphs.into_iter().zip(t.entry_exit_record()) {
                 if let Some(a) = rec.entry_anchor(t.offset_data()) {
-                    entries.insert(g.clone(), anchor_xy(&a.map_err(read_err)?));
+                    entries.insert(g.clone(), anchor_xy(&a?));
                 }
                 if let Some(a) = rec.exit_anchor(t.offset_data()) {
-                    exits.insert(g, anchor_xy(&a.map_err(read_err)?));
+                    exits.insert(g, anchor_xy(&a?));
                 }
             }
         }
         let att = Attachment {
             base_name: "cursive_entry".into(),
-            mark_name: "cursive_exit".into(),
             fullname: "cursive_entry_cursive_exit".into(),
             bases: entries,
             marks: exits,
@@ -846,11 +727,11 @@ impl<'a> Unparser<'a> {
         array: &read_fonts::tables::gpos::MarkArray,
         coverage: &[String],
         class_id: u16,
-    ) -> Result<ODict<String, (i32, i32)>, Error> {
-        let mut marks = ODict::new();
+    ) -> Result<IndexMap<String, (i32, i32)>, Error> {
+        let mut marks = IndexMap::new();
         for (i, rec) in array.mark_records().iter().enumerate() {
             if rec.mark_class() == class_id {
-                let anchor = rec.mark_anchor(array.offset_data()).map_err(read_err)?;
+                let anchor = rec.mark_anchor(array.offset_data())?;
                 let g = coverage.get(i).ok_or("mark coverage too short")?;
                 marks.insert(g.clone(), anchor_xy(&anchor));
             }
@@ -858,53 +739,57 @@ impl<'a> Unparser<'a> {
         Ok(marks)
     }
 
-    fn mark_to_base(
+    /// The rules of `unparseMarkToBase` and `unparseMarkToMark` for one
+    /// subtable: an attachment per mark class.
+    fn mark_attachments(
         &mut self,
-        subs: Vec<MarkBasePos>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("MarkToBase{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+        b: &mut Routine,
+        t: &MarkAttachment,
+        mark_to_mark: bool,
+    ) -> Result<(), Error> {
+        let mark_cov = coverage_glyphs(self.names, &t.mark_coverage)?;
+        let base_cov = coverage_glyphs(self.names, &t.base_coverage)?;
+        for class_id in 0..t.class_count {
+            let prefix = format!("Anchor{}", self.gensym());
+            let marks = self.mark_array(&t.marks, &mark_cov, class_id)?;
+            let mut bases = IndexMap::new();
+            for (i, row) in t.base_anchors.iter().enumerate() {
+                let Some(anchor) = row.get(class_id as usize).cloned().flatten() else {
+                    continue;
+                };
+                let anchor = anchor?;
+                let g = base_cov.get(i).ok_or(if mark_to_mark {
+                    "mark2 coverage too short"
+                } else {
+                    "base coverage too short"
+                })?;
+                bases.insert(g.clone(), anchor_xy(&anchor));
+            }
+            let fullname = if mark_to_mark {
+                format!("{prefix}_{prefix}_")
+            } else {
+                format!("{prefix}__{prefix}")
+            };
+            let att = Attachment {
+                fullname,
+                base_name: prefix,
+                bases,
+                marks,
+                has_font: true,
+                force_markmark: mark_to_mark,
+            };
+            b.rules.push(self.rule(RuleKind::Attachment(att)));
+        }
+        Ok(())
+    }
+
+    fn mark_to_base(&mut self, subs: Vec<MarkBasePos>) -> Result<Routine, Error> {
+        let mut b = self.start("MarkToBase")?;
         for sub in subs {
             let MarkBasePos::Format1(t) = &sub else {
                 return Err("unsupported MarkBasePos format".into());
             };
-            let mark_cov = opt_coverage_glyphs(self.names, t.mark_coverage())?;
-            let base_cov = opt_coverage_glyphs(self.names, t.base_coverage())?;
-            let mark_array = t.mark_array().map_err(read_err)?;
-            let base_array = t.base_array().map_err(read_err)?;
-            let base_records = collect!(base_array.base_records().iter());
-            for class_id in 0..t.mark_class_count() {
-                let prefix = format!("Anchor{}", self.gensym());
-                let marks = self.mark_array(&mark_array, &mark_cov, class_id)?;
-                let mut bases = ODict::new();
-                for (i, rec) in base_records.iter().enumerate() {
-                    for (c, anchor) in rec
-                        .base_anchors(base_array.offset_data())
-                        .iter()
-                        .enumerate()
-                    {
-                        if c != class_id as usize {
-                            continue;
-                        }
-                        let Some(anchor) = anchor else { continue };
-                        let anchor = anchor.map_err(read_err)?;
-                        let g = base_cov.get(i).ok_or("base coverage too short")?;
-                        bases.insert(g.clone(), anchor_xy(&anchor));
-                    }
-                }
-                let att = Attachment {
-                    fullname: format!("{prefix}__{prefix}"),
-                    mark_name: format!("_{prefix}"),
-                    base_name: prefix,
-                    bases,
-                    marks,
-                    has_font: true,
-                    force_markmark: false,
-                };
-                b.rules.push(self.rule(RuleKind::Attachment(att)));
-            }
+            self.mark_attachments(&mut b, &MarkAttachment::mark_to_base(t)?, false)?;
         }
         Ok(b)
     }
@@ -912,58 +797,17 @@ impl<'a> Unparser<'a> {
     /// `unparseMarkToLigature`: fontFeatures only dumps the subtables as XML
     /// comments ("unparsable"), which `asFea` never prints, so the routine
     /// has no rules and only its name and flags reach the output.
-    fn mark_to_ligature(
-        &mut self,
-        _subs: Vec<MarkLigPos>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("MarkToLigature{}", self.gensym());
-        self.routine(name, flag, mfs)
+    fn mark_to_ligature(&mut self, _subs: Vec<MarkLigPos>) -> Result<Routine, Error> {
+        self.start("MarkToLigature")
     }
 
-    fn mark_to_mark(
-        &mut self,
-        subs: Vec<MarkMarkPos>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let name = format!("MarkToMark{}", self.gensym());
-        let mut b = self.routine(name, flag, mfs)?;
+    fn mark_to_mark(&mut self, subs: Vec<MarkMarkPos>) -> Result<Routine, Error> {
+        let mut b = self.start("MarkToMark")?;
         for sub in subs {
             let MarkMarkPos::Format1(t) = &sub else {
                 return Err("unsupported MarkMarkPos format".into());
             };
-            let mark1_cov = opt_coverage_glyphs(self.names, t.mark1_coverage())?;
-            let mark2_cov = opt_coverage_glyphs(self.names, t.mark2_coverage())?;
-            let mark1_array = t.mark1_array().map_err(read_err)?;
-            let mark2_array = t.mark2_array().map_err(read_err)?;
-            let mark2_records = collect!(mark2_array.mark2_records().iter());
-            for class_id in 0..t.mark_class_count() {
-                let prefix = format!("Anchor{}", self.gensym());
-                let marks = self.mark_array(&mark1_array, &mark1_cov, class_id)?;
-                let mut bases = ODict::new();
-                for (i, rec) in mark2_records.iter().enumerate() {
-                    let anchor = rec
-                        .mark2_anchors(mark2_array.offset_data())
-                        .get(class_id as usize)
-                        .map(|a| a.map_err(read_err))
-                        .transpose()?;
-                    let Some(anchor) = anchor else { continue };
-                    let g = mark2_cov.get(i).ok_or("mark2 coverage too short")?;
-                    bases.insert(g.clone(), anchor_xy(&anchor));
-                }
-                let att = Attachment {
-                    fullname: format!("{prefix}_{prefix}_"),
-                    mark_name: format!("{prefix}_"),
-                    base_name: prefix,
-                    bases,
-                    marks,
-                    has_font: true,
-                    force_markmark: true,
-                };
-                b.rules.push(self.rule(RuleKind::Attachment(att)));
-            }
+            self.mark_attachments(&mut b, &MarkAttachment::mark_to_mark(t)?, true)?;
         }
         Ok(b)
     }
@@ -1037,31 +881,15 @@ impl<'a> Unparser<'a> {
         }))
     }
 
-    fn names_of(
-        &self,
-        gids: &[read_fonts::types::BigEndian<read_fonts::types::GlyphId16>],
-    ) -> Vec<Slot> {
-        gids.iter()
-            .map(|g| single(self.name(g.get().to_u32())))
-            .collect()
-    }
-
-    fn contextual(
-        &mut self,
-        subs: Vec<SequenceContext>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let sym = self.gensym();
-        let name = format!("Contextual{}{}", self.table, sym);
-        let mut b = self.routine(name, flag, mfs)?;
+    fn contextual(&mut self, subs: Vec<SequenceContext>) -> Result<Routine, Error> {
+        let mut b = self.start(&format!("Contextual{}", self.table))?;
         for sub in subs {
             match &sub {
                 SequenceContext::Format1(t) => {
-                    let cov = opt_coverage_glyphs(self.names, t.coverage())?;
+                    let cov = coverage_glyphs(self.names, &t.coverage()?)?;
                     for (ruleset, first) in t.seq_rule_sets().iter().zip(cov) {
-                        let ruleset = ruleset.ok_or("null SubRuleSet")?.map_err(read_err)?;
-                        for rule in collect!(ruleset.seq_rules().iter()) {
+                        let ruleset = ruleset.ok_or("null SubRuleSet")??;
+                        for rule in all(ruleset.seq_rules().iter())? {
                             let mut input = vec![single(first.clone())];
                             input.extend(self.names_of(rule.input_sequence()));
                             let r =
@@ -1071,18 +899,15 @@ impl<'a> Unparser<'a> {
                     }
                 }
                 SequenceContext::Format2(t) => {
-                    let cov: HashSet<String> = opt_coverage_glyphs(self.names, t.coverage())?
+                    let cov: HashSet<String> = coverage_glyphs(self.names, &t.coverage()?)?
                         .into_iter()
                         .collect();
-                    let inputs = invert_class_def(
-                        self.names,
-                        &class_defs(self.names, &t.class_def().map_err(read_err)?)?,
-                    );
+                    let inputs = self.classes(t.class_def())?;
                     for (class_id, ruleset) in t.class_seq_rule_sets().iter().enumerate() {
                         let Some(ruleset) = ruleset else { continue };
-                        let ruleset = ruleset.map_err(read_err)?;
+                        let ruleset = ruleset?;
                         let inputclass = input_class(&inputs, class_id, &cov);
-                        for rule in collect!(ruleset.class_seq_rules().iter()) {
+                        for rule in all(ruleset.class_seq_rules().iter())? {
                             let mut input = vec![inputclass.clone()];
                             for c in rule.input_sequence() {
                                 input.push(class_of(&inputs, c.get())?);
@@ -1094,10 +919,7 @@ impl<'a> Unparser<'a> {
                     }
                 }
                 SequenceContext::Format3(t) => {
-                    let mut input = Vec::new();
-                    for cov in collect!(t.coverages().iter()).iter() {
-                        input.push(coverage_glyphs(self.names, cov)?);
-                    }
+                    let input = self.coverage_slots(t.coverages().iter())?;
                     let r = self.chain_rule(input, vec![], vec![], t.seq_lookup_records())?;
                     b.rules.push(r);
                 }
@@ -1107,22 +929,15 @@ impl<'a> Unparser<'a> {
         Ok(b)
     }
 
-    fn chained_contextual(
-        &mut self,
-        subs: Vec<ChainedSequenceContext>,
-        flag: u16,
-        mfs: Option<u16>,
-    ) -> Result<Routine, Error> {
-        let sym = self.gensym();
-        let name = format!("ChainedContextual{}{}", self.table, sym);
-        let mut b = self.routine(name, flag, mfs)?;
+    fn chained_contextual(&mut self, subs: Vec<ChainedSequenceContext>) -> Result<Routine, Error> {
+        let mut b = self.start(&format!("ChainedContextual{}", self.table))?;
         for sub in subs {
             match &sub {
                 ChainedSequenceContext::Format1(t) => {
-                    let cov = opt_coverage_glyphs(self.names, t.coverage())?;
+                    let cov = coverage_glyphs(self.names, &t.coverage()?)?;
                     for (ruleset, first) in t.chained_seq_rule_sets().iter().zip(cov) {
-                        let ruleset = ruleset.ok_or("null ChainSubRuleSet")?.map_err(read_err)?;
-                        for rule in collect!(ruleset.chained_seq_rules().iter()) {
+                        let ruleset = ruleset.ok_or("null ChainSubRuleSet")??;
+                        for rule in all(ruleset.chained_seq_rules().iter())? {
                             let mut input = vec![single(first.clone())];
                             input.extend(self.names_of(rule.input_sequence()));
                             let mut prefix = self.names_of(rule.backtrack_sequence());
@@ -1136,33 +951,24 @@ impl<'a> Unparser<'a> {
                 }
                 ChainedSequenceContext::Format2(t) => {
                     let backtrack = if t.backtrack_class_def_offset().is_null() {
-                        ODict::new()
+                        IndexMap::new()
                     } else {
-                        invert_class_def(
-                            self.names,
-                            &class_defs(self.names, &t.backtrack_class_def().map_err(read_err)?)?,
-                        )
+                        self.classes(t.backtrack_class_def())?
                     };
                     let lookahead = if t.lookahead_class_def_offset().is_null() {
-                        ODict::new()
+                        IndexMap::new()
                     } else {
-                        invert_class_def(
-                            self.names,
-                            &class_defs(self.names, &t.lookahead_class_def().map_err(read_err)?)?,
-                        )
+                        self.classes(t.lookahead_class_def())?
                     };
-                    let inputs = invert_class_def(
-                        self.names,
-                        &class_defs(self.names, &t.input_class_def().map_err(read_err)?)?,
-                    );
-                    let cov: HashSet<String> = opt_coverage_glyphs(self.names, t.coverage())?
+                    let inputs = self.classes(t.input_class_def())?;
+                    let cov: HashSet<String> = coverage_glyphs(self.names, &t.coverage()?)?
                         .into_iter()
                         .collect();
                     for (class_id, ruleset) in t.chained_class_seq_rule_sets().iter().enumerate() {
                         let Some(ruleset) = ruleset else { continue };
-                        let ruleset = ruleset.map_err(read_err)?;
+                        let ruleset = ruleset?;
                         let inputclass = input_class(&inputs, class_id, &cov);
-                        for rule in collect!(ruleset.chained_class_seq_rules().iter()) {
+                        for rule in all(ruleset.chained_class_seq_rules().iter())? {
                             let mut prefix = Vec::new();
                             for c in rule.backtrack_sequence() {
                                 prefix.push(class_of(&backtrack, c.get())?);
@@ -1183,18 +989,10 @@ impl<'a> Unparser<'a> {
                     }
                 }
                 ChainedSequenceContext::Format3(t) => {
-                    let mut prefix = Vec::new();
-                    for cov in collect!(t.backtrack_coverages().iter()).iter().rev() {
-                        prefix.push(coverage_glyphs(self.names, cov)?);
-                    }
-                    let mut suffix = Vec::new();
-                    for cov in collect!(t.lookahead_coverages().iter()).iter() {
-                        suffix.push(coverage_glyphs(self.names, cov)?);
-                    }
-                    let mut input = Vec::new();
-                    for cov in collect!(t.input_coverages().iter()).iter() {
-                        input.push(coverage_glyphs(self.names, cov)?);
-                    }
+                    let mut prefix = self.coverage_slots(t.backtrack_coverages().iter())?;
+                    prefix.reverse();
+                    let suffix = self.coverage_slots(t.lookahead_coverages().iter())?;
+                    let input = self.coverage_slots(t.input_coverages().iter())?;
                     let r = self.chain_rule(input, prefix, suffix, t.seq_lookup_records())?;
                     b.rules.push(r);
                 }
@@ -1207,7 +1005,7 @@ impl<'a> Unparser<'a> {
 
 /// `[g for g in inputs.get(classId, []) if g in sub.Coverage.glyphs]`
 fn input_class(
-    inputs: &ODict<u16, Vec<String>>,
+    inputs: &IndexMap<u16, Vec<String>>,
     class_id: usize,
     cov: &HashSet<String>,
 ) -> Vec<String> {
@@ -1222,7 +1020,7 @@ fn input_class(
 
 /// `classes[c]` for a backtrack, lookahead or later input slot of a
 /// contextual format 2 rule.
-fn class_of(classes: &ODict<u16, Vec<String>>, c: u16) -> Result<Vec<String>, Error> {
+fn class_of(classes: &IndexMap<u16, Vec<String>>, c: u16) -> Result<Vec<String>, Error> {
     let glyphs = classes
         .get(&c)
         .cloned()
@@ -1233,22 +1031,4 @@ fn class_of(classes: &ODict<u16, Vec<String>>, c: u16) -> Result<Vec<String>, Er
         return Err("contextual rule with a one-glyph class 0 cannot be unparsed".into());
     }
     Ok(glyphs)
-}
-
-/// The glyph IDs of a coverage table, in the order of `coverage_glyphs`.
-fn coverage_gids(cov: &read_fonts::tables::layout::CoverageTable) -> Result<Vec<u32>, Error> {
-    use read_fonts::tables::layout::CoverageTable;
-    match cov {
-        CoverageTable::Format1(t) => Ok(t.glyph_array().iter().map(|g| g.get().to_u32()).collect()),
-        CoverageTable::Format2(t) => {
-            let mut ranges: Vec<_> = t.range_records().iter().collect();
-            ranges.sort_by_key(|r| r.start_coverage_index());
-            let mut gids = Vec::new();
-            for r in ranges {
-                gids.extend(r.start_glyph_id().to_u32()..r.end_glyph_id().to_u32() + 1);
-            }
-            Ok(gids)
-        }
-        other => Err(format!("unsupported Coverage format {}", other.coverage_format()).into()),
-    }
 }

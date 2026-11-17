@@ -61,9 +61,62 @@ fn unpack_pstrings(data: &[u8], n: usize) -> Vec<String> {
     strings
 }
 
+/// The font's glyph order, as fontTools' `TTFont.getGlyphOrder()` builds it,
+/// indexed by name.
+#[derive(Clone, Debug, Default)]
+pub struct GlyphOrder {
+    names: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl GlyphOrder {
+    /// A glyph order made of `names`.
+    pub fn new(names: Vec<String>) -> Self {
+        let index = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        GlyphOrder { names, index }
+    }
+
+    /// The names, by glyph ID.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The number of glyphs.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the font has no glyphs.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// fontTools' `getGlyphName`: glyph IDs beyond the order are named
+    /// `glyph%05d`.
+    pub fn name(&self, gid: u32) -> String {
+        match self.names.get(gid as usize) {
+            Some(name) => name.clone(),
+            None => format!("glyph{gid:05}"),
+        }
+    }
+
+    /// The glyph ID of a name in the order.
+    pub fn gid(&self, name: &str) -> Option<u32> {
+        self.index.get(name).copied()
+    }
+}
+
 /// The font's glyph order, with fontTools' handling of empty and duplicate
 /// names (`glyph%05d`, `name.N`).
-pub fn glyph_order(font: &FontRef) -> Result<Vec<String>, Error> {
+pub fn glyph_order(font: &FontRef) -> Result<GlyphOrder, Error> {
+    glyph_names(font).map(GlyphOrder::new)
+}
+
+fn glyph_names(font: &FontRef) -> Result<Vec<String>, Error> {
     let num_glyphs = font.maxp()?.num_glyphs() as usize;
     let post = font
         .table_data(Tag::new(b"post"))

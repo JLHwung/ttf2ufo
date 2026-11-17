@@ -11,17 +11,10 @@ use sha2::{Digest, Sha512};
 
 use crate::Error;
 use crate::instructions::lib_assembly;
+use crate::names::GlyphOrder;
 use crate::plist::{Dict, Value};
 use crate::pyfmt::{Num, float_repr_signed};
 use crate::ufo::{Component, Glyph, Point};
-
-/// Python's `f"{value:+}"` for an int or float.
-fn signed(n: Num) -> String {
-    match n {
-        Num::Int(i) => format!("{i:+}"),
-        Num::Float(f) => float_repr_signed(f),
-    }
-}
 
 /// fontTools' otRound.
 fn ot_round(v: f64) -> i64 {
@@ -36,7 +29,7 @@ fn f2dot14_round(v: f64) -> f64 {
 /// Read every glyph's outline, width, components, and TrueType program.
 pub fn extract_glyphs(
     font: &FontRef,
-    names: &[String],
+    names: &GlyphOrder,
     unicodes: &[Vec<u32>],
 ) -> Result<Vec<Glyph>, Error> {
     let glyf = font.glyf()?;
@@ -48,7 +41,7 @@ pub fn extract_glyphs(
 
     // Glyphs are independent of each other here, so read them in parallel.
     let read_glyph = |gid: usize| -> Result<(Glyph, Option<Vec<u8>>), Error> {
-        let name = &names[gid];
+        let name = &names.names()[gid];
         let id = GlyphId::new(gid as u32);
         let width = hmtx.advance(id).unwrap_or(0) as i64;
         let lsb = hmtx.side_bearing(id).unwrap_or(0) as i64;
@@ -99,10 +92,7 @@ pub fn extract_glyphs(
                 let mut object_libs = Dict::new();
                 let mut overlap = false;
                 for (ci, c) in g.components().enumerate() {
-                    let base = names
-                        .get(c.glyph.to_u32() as usize)
-                        .cloned()
-                        .unwrap_or_else(|| format!("glyph{:05}", c.glyph.to_u32()));
+                    let base = names.name(c.glyph.to_u32());
                     let transform = component_info(&c).map_err(|e| format!("{name}: {e}"))?;
                     let identifier = format!("component{ci}");
                     let mut flags = Dict::new();
@@ -168,17 +158,12 @@ pub fn extract_glyphs(
         .unzip();
 
     // extractGlyphPrograms: needs every glyph's outline for the component hash
-    let index: std::collections::HashMap<&str, usize> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
     let instructions: Vec<(usize, Dict)> = (0..num)
         .into_par_iter()
         .filter_map(|gid| programs[gid].as_ref().map(|p| (gid, p)))
         .map(|(gid, program)| -> Result<(usize, Dict), Error> {
             let mut hash_data = format!("w{}", glyphs[gid].width);
-            hash_glyph(&glyphs, &index, gid, true, &mut Vec::new(), &mut hash_data)?;
+            hash_glyph(&glyphs, names, gid, true, &mut Vec::new(), &mut hash_data)?;
             let id = if hash_data.len() >= 128 {
                 Sha512::digest(hash_data.as_bytes()).iter().fold(
                     String::with_capacity(128),
@@ -210,7 +195,7 @@ pub fn extract_glyphs(
 /// components.
 fn hash_glyph(
     glyphs: &[Glyph],
-    index: &std::collections::HashMap<&str, usize>,
+    names: &GlyphOrder,
     gid: usize,
     rounding: bool,
     stack: &mut Vec<usize>,
@@ -241,18 +226,19 @@ fn hash_glyph(
             }
             s
         } else {
-            c.transform.iter().map(|v| signed(*v)).collect()
+            c.transform.iter().map(|v| v.repr_signed()).collect()
         };
         out.push('[');
-        let base = *index
-            .get(c.base.as_str())
-            .ok_or_else(|| format!("missing component base glyph {}", c.base))?;
+        let base = names
+            .gid(&c.base)
+            .ok_or_else(|| format!("missing component base glyph {}", c.base))?
+            as usize;
         if stack.contains(&base) || stack.len() > 1000 {
             // Python recurses until RecursionError
             return Err(format!("component cycle through glyph {}", c.base).into());
         }
         stack.push(base);
-        hash_glyph(glyphs, index, base, false, stack, out)?;
+        hash_glyph(glyphs, names, base, false, stack, out)?;
         stack.pop();
         write!(out, "({tr})]")?;
     }
