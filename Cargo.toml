@@ -3,6 +3,10 @@ name = "ttf2ufo"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/JLHwung/ttf2ufo"
+description = "Extract a UFO from a TrueType font, byte for byte like ufo-extractor's extractufo"
+keywords = ["font", "ufo", "truetype", "ttf"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 indexmap = "2.14.2"
