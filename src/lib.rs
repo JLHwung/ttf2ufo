@@ -27,9 +27,9 @@
 //! The other modules hold the extraction steps, named after the extractor
 //! functions they port, and the formatting helpers that reproduce Python's
 //! output exactly. Fonts that would need behavior this crate does not
-//! implement, such as CFF outlines or legacy name encodings, make
-//! [`extract`] return an error instead of producing different output; the
-//! README lists them.
+//! implement, such as CFF outlines, make [`extract`] return an error instead
+//! of producing different output, as do fonts extractufo itself fails on;
+//! the README lists them.
 
 #![warn(missing_docs)]
 

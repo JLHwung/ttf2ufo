@@ -1,5 +1,7 @@
 //! Glyph order and names, as fontTools' `TTFont.getGlyphOrder()` builds them
-//! from the `post` table.
+//! from the `post` table. Format 4 tables name glyphs from their code points
+//! through the Adobe Glyph List; format 3, and format 1 with too few names
+//! for the font, fall back to names from the `cmap` and the AGL.
 
 use read_fonts::tables::post::DEFAULT_GLYPH_NAMES;
 use read_fonts::types::Tag;

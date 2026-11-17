@@ -11,10 +11,15 @@ ttf2ufo --update Font.ttf Out.ufo
 ```
 
 Without `--update` the output must not exist (extractufo refuses too). With
-`--update` an existing UFO is updated in place: every file is generated in
-memory first, then only files whose content changed are rewritten and files
-the font no longer produces (stale `.glif` files, a dropped `kerning.plist`)
-are removed. Unchanged files keep their mtime, so git does not re-hash them.
+`--update` an existing UFO is updated in place: only files whose content
+changed are rewritten, and files the font no longer produces (stale `.glif`
+files, a dropped `kerning.plist`) are removed. Unchanged files keep their
+mtime, so git does not re-hash them.
+
+Either way the UFO is checked before anything is written, so a font that
+extractufo would fail to save leaves the output untouched. `.glif` files are
+rendered one at a time while they are written or compared, so the whole
+package is never in memory at once.
 
 Set `TTF2UFO_TIMING=1` to print how long each stage takes.
 
@@ -81,15 +86,30 @@ ttf2ufo writes these in glyph order.
   ufo-extractor's own tests (`extractor_test.py`, `stream_test.py`);
 - `tests/golden_test.rs`: every file of the extracted UFO compared byte for
   byte with extractufo's output for the same font;
+- `tests/features_test.rs`: `features.fea` alone, reporting the first line
+  that differs;
 - unit tests for the Python behaviors that leak into the output (float
   `repr`, CPython set iteration order, tuple hashing, legacy name-record
   codecs, glyph file names), checked against values generated with
   CPython 3.14 and fontTools.
 
+`tests/compare.py` compares ttf2ufo with extractufo on any fonts. Pass
+`--plain`: ttf2ufo matches unpatched extractufo, apart from the set orders
+above. Without it, extractufo is patched with upstream fixes that ttf2ufo
+does not make (robotools/extractor#78 and #80, simoncozens/fontFeatures#75),
+so fonts those fixes touch differ. extractufo is slow, so the hashes of its
+output are cached in `~/.cache/ttf2ufo`, per font and per version of the
+reference packages:
+
+```sh
+cargo build --release
+/path/to/reference/python tests/compare.py --plain --list fonts.txt
+```
+
 `tests/data/regenerate.py` rebuilds the expected outputs, the generated
-tables in `src/agl.rs` and `src/codecs/`, and the unit-test cases from the
-Python reference implementation; see `tests/data/README.md` for where the test data
-comes from.
+tables in `src/agl.rs` and `src/codecs/`, and the codec and glyph file name
+unit-test cases from the Python reference implementation; see
+`tests/data/README.md` for where the test data comes from.
 
 ## License
 

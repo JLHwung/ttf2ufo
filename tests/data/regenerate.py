@@ -10,7 +10,10 @@ expected files were produced with. It writes:
   `extractufo` does (extractor.extractUFO into a ufoLib2 Font, saved as a
   package);
 - tests/data/stream/*.bin: bytecode for the assembly samples of extractor's
-  tests/stream_test.py, compiled with fontTools.
+  tests/stream_test.py, compiled with fontTools;
+- tests/data/filename_cases.json and codec_cases.json: unit-test cases for
+  glyph file names and legacy name-record decoding;
+- src/agl.rs and src/codecs/: the Adobe Glyph List and Python's codec tables.
 """
 import shutil
 import sys
