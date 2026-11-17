@@ -192,6 +192,10 @@ fn kerning_for_lookup(
                     .map(|g| names.get(g.to_u32()))
                     .collect();
                 let use_first = !t.value_format1().is_empty();
+                if t.pair_sets().len() < coverage.len() {
+                    // `pairSets[index]` for every coverage glyph: IndexError
+                    return Err("PairPos format 1 has fewer PairSets than coverage glyphs".into());
+                }
                 for (i, pair_set) in t.pair_sets().iter().enumerate() {
                     let Some(left_name) = coverage.get(i) else {
                         break;
@@ -446,36 +450,65 @@ pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, 
     Ok((nested, groups))
 }
 
-/// `_extractOpenTypeKerningFromKern`: format 0 subtables of a version 0 'kern' table.
+/// `_extractOpenTypeKerningFromKern`, over fontTools' `kern` decompile: the
+/// OpenType (version 0) and Apple (version 1.0) layouts. Every subtable must
+/// be format 0: other formats have no `version`, so extractor fails on them.
 fn kern_table(d: &[u8], names: &Names) -> Result<Pairs, Error> {
-    let u16_at = |at: usize| -> Result<u16, Error> {
-        Ok(u16::from_be_bytes(
-            d.get(at..at + 2).ok_or("bad 'kern' table")?.try_into()?,
-        ))
-    };
-    if u16_at(0)? != 0 {
-        return Err("only version 0 'kern' tables are supported".into());
+    fn be(d: &[u8], at: usize, n: usize) -> Result<u64, Error> {
+        let bytes = d.get(at..at + n).ok_or("bad 'kern' table")?;
+        Ok(bytes.iter().fold(0u64, |v, b| v << 8 | *b as u64))
     }
+    let version = be(d, 0, 2)?;
+    // `self.version == 1.0` picks the Apple subtable header; `apple` is what
+    // fontTools passes on to the format 0 subtable.
+    let (apple, apple_header, n_tables, mut data) = if d.len() >= 8 && version == 1 {
+        let v = be(d, 0, 4)?;
+        (true, v == 0x0001_0000, be(d, 4, 4)?, &d[8..])
+    } else {
+        (false, version == 1, be(d, 2, 2)?, &d[4..])
+    };
     let mut pairs = Pairs::new();
-    let mut at = 4usize;
-    for _ in 0..u16_at(2)? {
-        let (version, length, coverage) = (u16_at(at)?, u16_at(at + 2)? as usize, u16_at(at + 4)?);
-        if version != 0 || coverage >> 8 != 0 {
-            return Err("Unknown kern table formst".into());
+    for _ in 0..n_tables {
+        let (mut length, format) = if apple_header {
+            (be(data, 0, 4)? as usize, be(data, 5, 1)?)
+        } else {
+            let length = be(data, 2, 2)? as usize;
+            let format = be(data, 4, 1)?;
+            if n_tables == 1 && format == 0 {
+                // fontTools ignores the length of a lone format 0 subtable
+                (be(data, 6, 2)? as usize * 6 + 14, format)
+            } else {
+                (length, format)
+            }
+        };
+        if format != 0 {
+            return Err(format!("'kern' subtable format {format} has no version").into());
         }
-        let n = u16_at(at + 6)? as usize;
+        length = length.min(data.len());
+        let sub = &data[..length];
+        let body = if apple {
+            &sub[8.min(sub.len())..]
+        } else {
+            if be(sub, 0, 2)? != 0 {
+                return Err(
+                    format!("unsupported kern subtable version: {}", be(sub, 0, 2)?).into(),
+                );
+            }
+            &sub[6.min(sub.len())..]
+        };
+        let n = be(body, 0, 2)? as usize;
         for i in 0..n {
-            let p = at + 14 + 6 * i;
-            let value = u16_at(p + 4)? as i16 as i64;
+            let p = 8 + 6 * i;
+            let value = be(body, p + 4, 2)? as u16 as i16 as i64;
             pairs.insert(
                 (
-                    Side::Glyph(names.get(u16_at(p)? as u32)),
-                    Side::Glyph(names.get(u16_at(p + 2)? as u32)),
+                    Side::Glyph(names.get(be(body, p, 2)? as u32)),
+                    Side::Glyph(names.get(be(body, p + 2, 2)? as u32)),
                 ),
                 value,
             );
         }
-        at += length;
+        data = &data[length..];
     }
     Ok(pairs)
 }
@@ -507,7 +540,8 @@ pub fn extract_anchors(
         return Ok(out);
     };
     let lookup_indexes = gather_lookup_indexes(&gpos, &["mark", "mkmk"])?;
-    let lookups = gpos.lookup_list()?.lookups();
+    // extractor only reaches the LookupList through a referenced lookup, so
+    // a null LookupList is fine when no mark/mkmk feature uses one.
     let mut seen = std::collections::HashSet::new();
     let mut all: Vec<AnchorGroup> = Vec::new();
     for script in script_order(&gpos)? {
@@ -519,7 +553,7 @@ pub fn extract_anchors(
             if !seen.insert(index) {
                 continue;
             }
-            let lookup = lookups.get(index)?;
+            let lookup = gpos.lookup_list()?.lookups().get(index)?;
             if !matches!(lookup.lookup_type(), 4 | 6 | 9) {
                 continue;
             }

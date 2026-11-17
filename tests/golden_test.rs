@@ -50,7 +50,7 @@ fn first_difference(actual: &[u8], expected: &[u8]) -> String {
 fn check(font: &str, skip: &[&str]) {
     let bytes = std::fs::read(data(&format!("fonts/{font}.ttf"))).unwrap();
     let ufo = ttf2ufo::extract(&bytes).unwrap();
-    let actual = ufo.to_files();
+    let actual = ufo.to_files().unwrap();
     let expected = read_tree(&data(&format!("expected/{font}.ufo")));
     let skip: Vec<PathBuf> = skip.iter().map(PathBuf::from).collect();
 

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use read_fonts::ReadError;
 use read_fonts::tables::gpos::{
-    AnchorTable, CursivePos, Gpos, MarkBasePos, MarkMarkPos, PairPos, PositionLookup,
+    AnchorTable, CursivePos, Gpos, MarkBasePos, MarkLigPos, MarkMarkPos, PairPos, PositionLookup,
     PositionSubtables, SinglePos,
 };
 use read_fonts::tables::gsub::{
@@ -69,6 +69,8 @@ pub struct Unparser<'a> {
     pub gdef: &'a GdefInfo,
     /// `_table`: "GSUB" or "GPOS".
     pub table: &'static str,
+    /// The font's `Debg` table, parsed as JSON (or the parse error).
+    debg: Option<&'a Result<serde_json::Value, String>>,
     index: usize,
     /// Arena indices of this table's routines, by lookup index.
     lookups: Vec<usize>,
@@ -81,12 +83,14 @@ impl<'a> Unparser<'a> {
         names: &'a GlyphNames,
         gdef: &'a GdefInfo,
         table: &'static str,
+        debg: Option<&'a Result<serde_json::Value, String>>,
     ) -> Self {
         Unparser {
             ff,
             names,
             gdef,
             table,
+            debg,
             index: 0,
             lookups: Vec::new(),
             current_lookup: 0,
@@ -166,7 +170,8 @@ impl<'a> Unparser<'a> {
             let lookups: Vec<SubstitutionLookup> = collect!(lookup_list.lookups().iter());
             self.make_dummies(lookups.len());
             for (idx, lookup) in lookups.iter().enumerate() {
-                let routine = self.unparse_gsub_lookup(lookup, idx)?;
+                let mut routine = self.unparse_gsub_lookup(lookup, idx)?;
+                self.apply_debug_info(&mut routine, idx)?;
                 self.copy_routine(routine, idx);
             }
         }
@@ -187,7 +192,8 @@ impl<'a> Unparser<'a> {
             let lookups: Vec<PositionLookup> = collect!(lookup_list.lookups().iter());
             self.make_dummies(lookups.len());
             for (idx, lookup) in lookups.iter().enumerate() {
-                let routine = self.unparse_gpos_lookup(lookup, idx)?;
+                let mut routine = self.unparse_gpos_lookup(lookup, idx)?;
+                self.apply_debug_info(&mut routine, idx)?;
                 self.copy_routine(routine, idx);
             }
         }
@@ -203,6 +209,56 @@ impl<'a> Unparser<'a> {
             self.lookups.push(id);
             self.ff.routines.push(id);
         }
+    }
+
+    /// The `getDebugInfo` part of `unparseLookups`: with feaLib debug data in
+    /// a `Debg` table, a lookup gets its source address and original name.
+    fn apply_debug_info(&self, routine: &mut Routine, idx: usize) -> Result<(), Error> {
+        use serde_json::Value as J;
+        const KEY: &str = "com.github.fonttools.feaLib";
+        let Some(debg) = self.debg else {
+            return Ok(());
+        };
+        let data = debg
+            .as_ref()
+            .map_err(|e| format!("bad 'Debg' table: {e}"))?;
+        // `KEY in data`, then `data[KEY][table][str(ix)]`
+        let present = match data {
+            J::Object(m) => m.contains_key(KEY),
+            J::Array(a) => a.iter().any(|v| v.as_str() == Some(KEY)),
+            J::String(s) => s.contains(KEY),
+            _ => true,
+        };
+        if !present {
+            return Ok(());
+        }
+        let bad = || {
+            Error::from(format!(
+                "'Debg' has no usable feaLib entry for {} lookup {idx}",
+                self.table
+            ))
+        };
+        let entry = data
+            .get(KEY)
+            .and_then(|d| d.get(self.table))
+            .and_then(|d| d.get(idx.to_string()))
+            .and_then(J::as_array)
+            .filter(|a| a.len() >= 2)
+            .ok_or_else(bad)?;
+        // `debug_data[1].replace("-", "_")`: only a string has `replace`
+        let name = entry[1].as_str().ok_or_else(bad)?.replace('-', "_");
+        let location = match &entry[0] {
+            J::String(s) => s.clone(),
+            J::Null => "None".to_string(),
+            J::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+            J::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
+            _ => return Err("unsupported 'Debg' source location".into()),
+        };
+        routine.address = Some(format!("{} {idx} {location} {name}", self.table));
+        if !name.is_empty() {
+            routine.name = name;
+        }
+        Ok(())
     }
 
     /// `_copyRoutineToRoutine`
@@ -384,11 +440,10 @@ impl<'a> Unparser<'a> {
                 let v = collect!(s.iter());
                 self.run(is_ext, v, flag, mfs, Self::mark_to_base)
             }
-            PositionSubtables::MarkToLig(_) => Err(
-                "GPOS lookup type 5 (mark-to-ligature) is not supported: fontFeatures dumps it as \
-                 fontTools XML comments"
-                    .into(),
-            ),
+            PositionSubtables::MarkToLig(s) => {
+                let v = collect!(s.iter());
+                self.run(is_ext, v, flag, mfs, Self::mark_to_ligature)
+            }
             PositionSubtables::MarkToMark(s) => {
                 let v = collect!(s.iter());
                 self.run(is_ext, v, flag, mfs, Self::mark_to_mark)
@@ -854,6 +909,19 @@ impl<'a> Unparser<'a> {
         Ok(b)
     }
 
+    /// `unparseMarkToLigature`: fontFeatures only dumps the subtables as XML
+    /// comments ("unparsable"), which `asFea` never prints, so the routine
+    /// has no rules and only its name and flags reach the output.
+    fn mark_to_ligature(
+        &mut self,
+        _subs: Vec<MarkLigPos>,
+        flag: u16,
+        mfs: Option<u16>,
+    ) -> Result<Routine, Error> {
+        let name = format!("MarkToLigature{}", self.gensym());
+        self.routine(name, flag, mfs)
+    }
+
     fn mark_to_mark(
         &mut self,
         subs: Vec<MarkMarkPos>,
@@ -1152,11 +1220,19 @@ fn input_class(
         .unwrap_or_default()
 }
 
+/// `classes[c]` for a backtrack, lookahead or later input slot of a
+/// contextual format 2 rule.
 fn class_of(classes: &ODict<u16, Vec<String>>, c: u16) -> Result<Vec<String>, Error> {
-    classes
+    let glyphs = classes
         .get(&c)
         .cloned()
-        .ok_or_else(|| format!("class {c} is not defined in the ClassDef").into())
+        .ok_or_else(|| Error::from(format!("class {c} is not defined in the ClassDef")))?;
+    if c == 0 && glyphs.len() == 1 {
+        // Class 0 is a Python set here, and Chaining's glyphref indexes a
+        // one-glyph class: TypeError.
+        return Err("contextual rule with a one-glyph class 0 cannot be unparsed".into());
+    }
+    Ok(glyphs)
 }
 
 /// The glyph IDs of a coverage table, in the order of `coverage_glyphs`.

@@ -33,13 +33,17 @@ pub fn extract_features(font: &FontRef) -> Result<String, Error> {
         },
     };
     let gdef = GdefInfo::load(font, &names);
+    // fontTools parses `Debg` lazily; a parse error only matters when read.
+    let debg = font
+        .table_data(Tag::new(b"Debg"))
+        .map(|d| serde_json::from_slice(d.as_bytes()).map_err(|e| e.to_string()));
     if has_gsub {
         let gsub = font.gsub().map_err(read_err)?;
-        Unparser::new(&mut ff, &names, &gdef, "GSUB").unparse_gsub(&gsub)?;
+        Unparser::new(&mut ff, &names, &gdef, "GSUB", debg.as_ref()).unparse_gsub(&gsub)?;
     }
     if has_gpos {
         let gpos = font.gpos().map_err(read_err)?;
-        Unparser::new(&mut ff, &names, &gdef, "GPOS").unparse_gpos(&gpos)?;
+        Unparser::new(&mut ff, &names, &gdef, "GPOS", debg.as_ref()).unparse_gpos(&gpos)?;
     }
     fea::as_fea(&mut ff, &gdef)
 }

@@ -5,7 +5,44 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::Error;
 use crate::pyfmt::float_repr;
+
+/// lxml's check on every string fontTools writes as XML (plistlib and
+/// glifLib): no C0 control characters other than tab, LF and CR, and no
+/// U+FFFE or U+FFFF. ufoLib2 refuses to save a UFO that fails it.
+pub fn check_xml_str(s: &str) -> Result<(), Error> {
+    let bad = s
+        .bytes()
+        .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+        || s.contains(['\u{FFFE}', '\u{FFFF}']);
+    if bad {
+        return Err(format!(
+            "{s:?}: All strings must be XML compatible: Unicode or ASCII, no NULL bytes or \
+             control characters"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// [`check_xml_str`] on every string and dict key in `value`.
+pub fn check_xml_value(value: &Value) -> Result<(), Error> {
+    match value {
+        Value::Str(s) => check_xml_str(s),
+        Value::Array(items) => items.iter().try_for_each(check_xml_value),
+        Value::Dict(d) => check_xml_dict(d),
+        Value::Bool(_) | Value::Int(_) | Value::Real(_) => Ok(()),
+    }
+}
+
+/// [`check_xml_str`] on every string and key in `dict`.
+pub fn check_xml_dict(dict: &Dict) -> Result<(), Error> {
+    dict.iter().try_for_each(|(k, v)| {
+        check_xml_str(k)?;
+        check_xml_value(v)
+    })
+}
 
 /// A plist dictionary. `BTreeMap<String, _>` iterates in code point order,
 /// which is how Python sorts `str` keys.

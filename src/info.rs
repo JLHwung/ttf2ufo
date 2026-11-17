@@ -28,8 +28,8 @@ fn is_ascii_text(c: u32) -> bool {
     (0x20..=0x7E).contains(&c) || matches!(c, 0x09 | 0x0A | 0x0D)
 }
 
-/// fontTools' NameRecord.toUnicode(), for the encodings it maps to
-/// utf_16_be, mac_roman, ascii and latin1.
+/// fontTools' NameRecord.toUnicode(), with the codec
+/// `fontTools.misc.encodingTools.getEncoding` picks (ascii by default).
 fn decode_name(platform: u16, encoding: u16, language: u16, bytes: &[u8]) -> Result<String, Error> {
     let codec = match (platform, encoding) {
         (0, 0..=6) => "utf_16_be",
@@ -38,20 +38,27 @@ fn decode_name(platform: u16, encoding: u16, language: u16, bytes: &[u8]) -> Res
         (2, 0) => "ascii",
         (2, 2) => "latin1",
         (1, 0) => match language {
-            15 | 17 | 18 | 24..=28 | 36..=40 => {
-                return Err(format!(
-                    "name records in Mac encoding for language {language} are not supported"
-                )
-                .into());
-            }
+            15 => "mac_iceland",
+            17 => "mac_turkish",
+            18 => "mac_croatian",
+            24..=28 | 36 | 38..=40 => "mac_latin2",
+            37 => "mac_romanian",
             _ => "mac_roman",
         },
-        (1, 1 | 2 | 3 | 6 | 7 | 25 | 29 | 35 | 37) | (3, 2..=6) => {
-            return Err(format!(
-                "name records in encoding ({platform}, {encoding}) are not supported"
-            )
-            .into());
-        }
+        (1, 1) => "x_mac_japanese_ttx",
+        (1, 2) => "x_mac_trad_chinese_ttx",
+        (1, 3) => "x_mac_korean_ttx",
+        (1, 6) => "mac_greek",
+        (1, 7) => "mac_cyrillic",
+        (1, 25) => "x_mac_simp_chinese_ttx",
+        (1, 29) => "mac_latin2",
+        (1, 35) => "mac_turkish",
+        (1, 37) => "mac_iceland",
+        (3, 2) => "shift_jis",
+        (3, 3) => "gb2312",
+        (3, 4) => "big5",
+        (3, 5) => "euc_kr",
+        (3, 6) => "johab",
         _ => "ascii",
     };
     let mut bytes = bytes.to_vec();
@@ -93,12 +100,14 @@ fn decode_name(platform: u16, encoding: u16, language: u16, bytes: &[u8]) -> Res
             })
             .collect(),
         "latin1" => bytes.iter().map(|&b| b as char).collect(),
-        _ => {
+        "ascii" => {
             if bytes.iter().any(|b| *b >= 0x80) {
                 return Err("undecodable ASCII name record".into());
             }
             bytes.iter().map(|&b| b as char).collect()
         }
+        codec => crate::codecs::decode(codec, &bytes)
+            .ok_or_else(|| format!("no decoder for codec {codec}"))??,
     };
     // a decoded string that still looks like UTF-16BE ASCII is narrowed down
     let chars: Vec<char> = string.chars().collect();
@@ -128,10 +137,12 @@ fn int_list(values: &[i64]) -> Value {
 /// `time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime(max(0, date + mac_epoch_diff)))`
 /// for a `head` timestamp as fontTools decodes it.
 fn format_date(raw: i64) -> String {
-    let mut value = raw;
+    // fontTools reads the field as an unsigned 64-bit integer
+    let mut value = raw as u64;
     if value > 0xFFFF_FFFF {
         value &= 0xFFFF_FFFF;
     }
+    let mut value = value as i64;
     if value < 0x7C25_9DC0 {
         value += 0x7C25_9DC0;
     }
@@ -195,7 +206,16 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
         "openTypeHeadLowestRecPPEM",
         Value::Int(head.lowest_rec_ppem() as i64),
     );
-    let flags = bits(head.flags().bits() as u64, 0);
+    // The raw field: read-fonts' `head.flags()` drops the bits it doesn't
+    // define (5-10), which fontTools keeps.
+    let raw_flags = u16::from_be_bytes(
+        head.offset_data()
+            .as_bytes()
+            .get(16..18)
+            .ok_or("bad 'head' table")?
+            .try_into()?,
+    );
+    let flags = bits(raw_flags as u64, 0);
     if flags.iter().all(|b| *b <= 14) {
         set(&mut info, "openTypeHeadFlags", int_list(&flags));
     }
@@ -287,6 +307,14 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
         }
     }
     records.sort();
+    // Python sorts (nameID, platformID, encodingID, languageID, dict) tuples;
+    // two records with the same IDs compare their dicts: TypeError.
+    if records
+        .windows(2)
+        .any(|w| (w[0].0, w[0].1, w[0].2, w[0].3) == (w[1].0, w[1].1, w[1].2, w[1].3))
+    {
+        return Err("duplicate name records cannot be sorted".into());
+    }
     let name_records: Vec<Value> = records
         .into_iter()
         .map(|(nid, pid, eid, lid, s)| {
@@ -494,16 +522,26 @@ pub fn extract_info(font: &FontRef) -> Result<(Dict, Dict), Error> {
     // gasp
     if let Some(data) = font.table_data(Tag::new(b"gasp")) {
         let d = data.as_bytes();
-        let n = u16::from_be_bytes([d[2], d[3]]) as usize;
+        let u16_at = |at: usize| -> Result<u16, Error> {
+            Ok(u16::from_be_bytes(
+                d.get(at..at + 2).ok_or("bad 'gasp' table")?.try_into()?,
+            ))
+        };
+        // fontTools asserts the version and that no data is left over
+        let version = u16_at(0)?;
+        if version > 1 {
+            return Err(format!("unknown 'gasp' format: {version}").into());
+        }
+        let n = u16_at(2)? as usize;
+        if d.len() > 4 + 4 * n {
+            return Err("too much data in 'gasp' table".into());
+        }
         let mut ranges: Vec<(i64, u16)> = (0..n)
-            .map(|i| {
+            .map(|i| -> Result<(i64, u16), Error> {
                 let at = 4 + 4 * i;
-                (
-                    u16::from_be_bytes([d[at], d[at + 1]]) as i64,
-                    u16::from_be_bytes([d[at + 2], d[at + 3]]),
-                )
+                Ok((u16_at(at)? as i64, u16_at(at + 2)?))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         // fontTools keeps a dict (last record per size wins), then sorts
         let mut by_size = std::collections::BTreeMap::new();
         for (size, behavior) in ranges.drain(..) {

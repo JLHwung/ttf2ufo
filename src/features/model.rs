@@ -236,6 +236,9 @@ pub struct Routine {
     pub usecount: i64,
     pub mark_filtering_set_as_class: Option<String>,
     pub mark_attachment_set_as_class: Option<String>,
+    /// `routine.address` from the font's `Debg` table, already joined as
+    /// `" ".join(str(x) for x in address)`.
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Default)]

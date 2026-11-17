@@ -33,7 +33,9 @@
 
 #![warn(missing_docs)]
 
+pub mod agl;
 pub mod cmap;
+pub mod codecs;
 pub mod features;
 pub mod glyphs;
 pub mod info;

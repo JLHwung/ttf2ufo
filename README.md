@@ -59,12 +59,19 @@ These stop with an error instead of producing output that could differ from
 extractufo's:
 
 - CFF-flavored (`.otf`) fonts;
-- fonts without glyph names in `post` (format 3), whose names fontTools
-  derives from the cmap and the Adobe Glyph List;
-- name records in legacy CJK, Greek, Cyrillic or other non-Roman Mac/Windows
-  encodings, and a non-ASCII OS/2 vendor ID;
-- point-matched (anchor-positioned) components;
-- cmap subtable formats 2, 8 and 10 on a Unicode platform.
+- a cmap format 2 subtable on a Unicode platform;
+- an EUC-KR name record using a KS X 1001 Annex 3 make-up sequence.
+
+Where extractufo itself fails, ttf2ufo fails too rather than writing a UFO:
+for example point-matched components, a non-ASCII OS/2 vendor ID, cmap
+formats 8 and 10 on a Unicode platform, strings that are not valid in XML,
+cyclic components, and unnamed lookups in a feaLib `Debg` table.
+
+extractufo's own output is not reproducible in two places, because
+fontFeatures iterates Python sets of glyph names (their order depends on
+`PYTHONHASHSEED`): the order of `pos cursive` rules, and the glyph order of a
+class-0 glyph class with two to five glyphs in a contextual format 2 rule.
+ttf2ufo writes these in glyph order.
 
 ## Tests
 
@@ -75,11 +82,13 @@ extractufo's:
 - `tests/golden_test.rs`: every file of the extracted UFO compared byte for
   byte with extractufo's output for the same font;
 - unit tests for the Python behaviors that leak into the output (float
-  `repr`, CPython set iteration order, tuple hashing), checked against values
-  generated with CPython 3.14.
+  `repr`, CPython set iteration order, tuple hashing, legacy name-record
+  codecs, glyph file names), checked against values generated with
+  CPython 3.14 and fontTools.
 
-`tests/data/regenerate.py` rebuilds the expected outputs from the Python
-reference implementation; see `tests/data/README.md` for where the test data
+`tests/data/regenerate.py` rebuilds the expected outputs, the generated
+tables in `src/agl.rs` and `src/codecs/`, and the unit-test cases from the
+Python reference implementation; see `tests/data/README.md` for where the test data
 comes from.
 
 ## License

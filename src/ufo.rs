@@ -165,20 +165,20 @@ impl Glyph {
 
 /// fontTools.misc.filenames.userNameToFileName with suffix ".glif".
 pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> String {
-    const ILLEGAL: &[char] = &[
-        '"', '*', '+', '/', ':', '<', '>', '?', '[', '\\', ']', '|', '\0',
-    ];
+    // fontTools' list has r"\0" (backslash, zero), so NUL is not replaced
+    const ILLEGAL: &[char] = &['"', '*', '+', '/', ':', '<', '>', '?', '[', '\\', ']', '|'];
     const RESERVED: &[&str] = &[
         "con", "prn", "aux", "clock$", "nul", "a:-z:", "com1", "lpt1", "lpt2", "lpt3", "com2",
         "com3", "com4",
     ];
+    const SUFFIX: &str = ".glif";
     let mut user = name.to_string();
     if user.starts_with('.') {
         user = format!("_{}", &user[1..]);
     }
     let mut filtered = String::new();
     for c in user.chars() {
-        if ILLEGAL.contains(&c) || (c as u32) < 32 || c as u32 == 0x7F {
+        if ILLEGAL.contains(&c) || (1..32).contains(&(c as u32)) || c as u32 == 0x7F {
             filtered.push('_');
         } else {
             filtered.push(c);
@@ -187,7 +187,9 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
             }
         }
     }
-    let base: String = filtered
+    // truncated before the reserved-name prefixes are added
+    let filtered: String = filtered.chars().take(255 - SUFFIX.len()).collect();
+    let mut base: String = filtered
         .split('.')
         .map(|part| {
             if RESERVED.contains(&part.to_lowercase().as_str()) {
@@ -198,13 +200,16 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
         })
         .collect::<Vec<_>>()
         .join(".");
-    let base: String = base.chars().take(255 - ".glif".len()).collect();
-    let mut file = format!("{base}.glif");
+    let mut file = format!("{base}{SUFFIX}");
     if existing_lower.contains(&file.to_lowercase()) {
-        // handleClash1: 15-digit counter between name and suffix
+        // handleClash1: room for a 15-digit counter between name and suffix
+        let len = base.chars().count();
+        if len + SUFFIX.len() + 15 > 255 {
+            base = base.chars().take(255 - SUFFIX.len() - 15).collect();
+        }
         let mut n = 1u64;
         loop {
-            let cand = format!("{base}{n:015}.glif");
+            let cand = format!("{base}{n:015}{SUFFIX}");
             if !existing_lower.contains(&cand.to_lowercase()) {
                 file = cand;
                 break;
@@ -214,6 +219,27 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
     }
     existing_lower.insert(file.to_lowercase());
     file
+}
+
+/// glifLib's `GLIFPointPen` validation that TrueType outlines can fail: a
+/// curve point after more than two off-curve points (a cubic segment with
+/// several off-curve pairs). The count restarts with each contour.
+fn check_outline(glyph: &Glyph) -> Result<(), Error> {
+    for contour in &glyph.contours {
+        let mut off_curves = 0;
+        for p in contour {
+            match p.typ {
+                None => off_curves += 1,
+                Some(t) => {
+                    if t == "curve" && off_curves > 2 {
+                        return Err("too many offcurve points before curve point.".into());
+                    }
+                    off_curves = 0;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A whole UFO in memory.
@@ -239,8 +265,40 @@ impl Ufo {
         self.glyphs.iter().find(|g| g.name == name)
     }
 
-    /// Every file of the UFO package: relative path -> content.
-    pub fn to_files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+    /// Fail where ufoLib2's save fails: a string that goes into a plist or
+    /// .glif is not XML compatible (see [`plist::check_xml_str`]; features.fea
+    /// is plain text and is not checked), or glifLib's point pen rejects an
+    /// outline.
+    pub fn validate(&self) -> Result<(), Error> {
+        for (file, dict) in [
+            ("fontinfo.plist", &self.info),
+            ("groups.plist", &self.groups),
+            ("kerning.plist", &self.kerning),
+            ("lib.plist", &self.lib),
+        ] {
+            plist::check_xml_dict(dict)
+                .map_err(|e| format!("'{file}' could not be written: {e}"))?;
+        }
+        self.glyphs
+            .par_iter()
+            .try_for_each(|g| -> Result<(), Error> {
+                let strings = std::iter::once(&g.name)
+                    .chain(g.anchors.iter().map(|a| &a.name))
+                    .chain(g.components.iter().map(|c| &c.base))
+                    .chain(g.components.iter().filter_map(|c| c.identifier.as_ref()));
+                strings
+                    .map(|s| plist::check_xml_str(s))
+                    .chain(std::iter::once(plist::check_xml_dict(&g.lib)))
+                    .chain(std::iter::once(check_outline(g)))
+                    .collect::<Result<(), Error>>()
+                    .map_err(|e| format!("glyph {:?} could not be written: {e}", g.name).into())
+            })
+    }
+
+    /// Every file of the UFO package: relative path -> content. Fails where
+    /// ufoLib2's save fails (see [`Ufo::validate`]).
+    pub fn to_files(&self) -> Result<BTreeMap<PathBuf, Vec<u8>>, Error> {
+        self.validate()?;
         let mut files = BTreeMap::new();
         let mut put = |path: &str, content: String| {
             files.insert(PathBuf::from(path), content.into_bytes());
@@ -290,7 +348,7 @@ impl Ufo {
             .map(|(g, f)| (Path::new("glyphs").join(f), g.to_glif().into_bytes()))
             .collect();
         files.extend(rendered);
-        files
+        Ok(files)
     }
 
     /// Write the UFO to `path`, which must not exist yet.
@@ -299,7 +357,7 @@ impl Ufo {
             return Err(format!("{} already exists", path.display()).into());
         }
         let timer = crate::Timer::new();
-        let files = self.to_files();
+        let files = self.to_files()?;
         timer.lap("serialize");
         write_files(path, &files)?;
         timer.lap("write");
@@ -311,7 +369,7 @@ impl Ufo {
     /// (files written, files removed).
     pub fn sync(&self, path: &Path) -> Result<(usize, usize), Error> {
         let timer = crate::Timer::new();
-        let files = self.to_files();
+        let files = self.to_files()?;
         timer.lap("serialize");
         std::fs::create_dir_all(path.join("glyphs"))?;
         let written = files
@@ -356,4 +414,21 @@ fn write_files(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<(), Er
         .map(|(rel, content)| std::fs::write(root.join(rel), content).map_err(Error::from))
         .collect::<Result<Vec<()>, Error>>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// File names from fontTools' `userNameToFileName(name, existing,
+    /// suffix=".glif")`, each added to `existing` in turn.
+    #[test]
+    fn glyph_file_names_match_fonttools() {
+        let cases: Vec<(String, String)> =
+            serde_json::from_str(include_str!("../tests/data/filename_cases.json")).unwrap();
+        let mut existing = HashSet::new();
+        for (name, expected) in cases {
+            assert_eq!(glyph_file_name(&name, &mut existing), expected, "{name:?}");
+        }
+    }
 }

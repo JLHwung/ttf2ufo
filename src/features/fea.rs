@@ -397,6 +397,7 @@ impl Routine {
             usecount: self.usecount,
             mark_filtering_set_as_class: self.mark_filtering_set_as_class.clone(),
             mark_attachment_set_as_class: self.mark_attachment_set_as_class.clone(),
+            address: self.address.clone(),
         }
     }
 }
@@ -530,6 +531,10 @@ impl Writer<'_> {
         let mut body = Vec::new();
         body.push(Stmt::Text(lookupflag(routine)));
         body.push(Stmt::Text(";".to_string()));
+        if let Some(address) = &routine.address {
+            body.push(Stmt::Text(format!("# Original source: {address} ")));
+        }
+        // A routine address is a tuple, never equal to a rule's int address.
         let mut lastaddress: Option<usize> = None;
         for rule in &routine.rules {
             if let Some(a) = rule.address

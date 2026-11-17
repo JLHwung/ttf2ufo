@@ -65,12 +65,14 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
                         let gid = if ro == 0 {
                             (code + d) & 0xFFFF
                         } else {
-                            let index = code + partial;
-                            let g = glyph_ids
-                                .get(
-                                    usize::try_from(index)
-                                        .map_err(|_| "bad cmap format 4 index")?,
-                                )
+                            // a negative index counts from the end, as in Python
+                            let mut index = code + partial;
+                            if index < 0 {
+                                index += glyph_ids.len() as i64;
+                            }
+                            let g = usize::try_from(index)
+                                .ok()
+                                .and_then(|i| glyph_ids.get(i))
                                 .ok_or("bad cmap format 4 index")?
                                 .get() as i64;
                             if g != 0 { (g + d) & 0xFFFF } else { 0 }
@@ -139,6 +141,26 @@ fn format_of(t: &CmapSubtable) -> u16 {
     }
 }
 
+/// `cmap.buildReversedMin()`, by glyph id: the lowest code point mapped to
+/// each glyph by a Unicode subtable. Empty without a `cmap` table.
+pub fn reversed_min(font: &FontRef) -> Result<std::collections::HashMap<u32, u32>, Error> {
+    let cmap = match font.cmap() {
+        Ok(cmap) => cmap,
+        Err(read_fonts::ReadError::TableIsMissing(_)) => return Ok(Default::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut result = std::collections::HashMap::new();
+    for t in decode_subtables(&cmap)?.iter().filter(|t| t.is_unicode()) {
+        for (&code, &gid) in &t.map {
+            result
+                .entry(gid)
+                .and_modify(|c: &mut u32| *c = (*c).min(code))
+                .or_insert(code);
+        }
+    }
+    Ok(result)
+}
+
 /// A variation selector's entries: (base char, Some(glyph id) | None for default UVS).
 pub type UvsRecord = (u32, Vec<(u32, Option<u32>)>);
 
@@ -155,13 +177,13 @@ pub struct CharMap {
 /// Read the `cmap` table. A font without one has no code points and no
 /// variation sequences.
 pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
-    let Ok(cmap) = font.cmap() else {
-        return Ok(CharMap {
-            unicodes: vec![Vec::new(); num_glyphs],
-            best: None,
-            uvs: Vec::new(),
-        });
-    };
+    // extractor calls `source.get("cmap").buildReversed()` unconditionally
+    let cmap = font.cmap().map_err(|e| match e {
+        read_fonts::ReadError::TableIsMissing(_) => {
+            "fonts without a 'cmap' table are not supported".into()
+        }
+        e => Error::from(e),
+    })?;
     let subtables = decode_subtables(&cmap)?;
 
     // buildReversed: name -> set of code points, over all Unicode subtables
@@ -200,6 +222,9 @@ pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
     for (i, record) in cmap.encoding_records().iter().enumerate() {
         let _ = record;
         if let CmapSubtable::Format14(t) = cmap.subtable(i as u16)? {
+            // extractor assigns the lib key once per format 14 subtable: the
+            // last one wins
+            uvs.clear();
             let data = t.offset_data();
             for selector in t.var_selector() {
                 let mut entries = Vec::new();

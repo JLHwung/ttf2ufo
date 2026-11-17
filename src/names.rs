@@ -7,6 +7,36 @@ use read_fonts::{FontRef, TableProvider};
 use std::collections::{HashMap, HashSet};
 
 use crate::Error;
+use crate::agl::uv2agl;
+
+/// `TTFont._getGlyphNamesFromCmap`: names made from each glyph's lowest
+/// Unicode code point (`_makeGlyphName`), `glyph%05d` for the rest.
+fn names_from_cmap(font: &FontRef, num_glyphs: usize) -> Result<Vec<String>, Error> {
+    if num_glyphs == 0 {
+        return Err("fonts without glyphs are not supported".into());
+    }
+    let mut order: Vec<String> = (0..num_glyphs).map(|i| format!("glyph{i:05}")).collect();
+    order[0] = ".notdef".to_string();
+    let reversed = crate::cmap::reversed_min(font)?;
+    let mut use_count: HashMap<String, usize> = HashMap::new();
+    for (gid, slot) in order.iter_mut().enumerate() {
+        let Some(&uv) = reversed.get(&(gid as u32)) else {
+            continue;
+        };
+        let mut name = match uv2agl(uv) {
+            Some(name) => name.to_string(),
+            None if uv <= 0xFFFF => format!("uni{uv:04X}"),
+            None => format!("u{uv:X}"),
+        };
+        let uses = use_count.entry(name.clone()).or_insert(0);
+        *uses += 1;
+        if *uses > 1 {
+            name = format!("{name}.alt{}", *uses - 1);
+        }
+        *slot = name;
+    }
+    Ok(order)
+}
 
 fn be16(data: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(data.get(at..at + 2)?.try_into().ok()?))
@@ -43,10 +73,8 @@ pub fn glyph_order(font: &FontRef) -> Result<Vec<String>, Error> {
     let mut order: Vec<String> = match version {
         0x0001_0000 => {
             if num_glyphs > DEFAULT_GLYPH_NAMES.len() {
-                return Err(
-                    "'post' format 1 has too few names; cmap-derived glyph names are not supported"
-                        .into(),
-                );
+                // "Not enough names found in the 'post' table"
+                return names_from_cmap(font, num_glyphs);
             }
             DEFAULT_GLYPH_NAMES[..num_glyphs]
                 .iter()
@@ -56,6 +84,10 @@ pub fn glyph_order(font: &FontRef) -> Result<Vec<String>, Error> {
         0x0002_0000 => {
             let declared = be16(post, 32).ok_or("bad 'post' table")? as usize;
             let count = declared.min(num_glyphs);
+            if count == 0 {
+                // `max(indices)` of an empty array: ValueError
+                return Err("'post' format 2 table without glyphs".into());
+            }
             let indices: Vec<usize> = (0..count)
                 .map(|i| {
                     be16(post, 34 + 2 * i)
@@ -76,10 +108,30 @@ pub fn glyph_order(font: &FontRef) -> Result<Vec<String>, Error> {
             }
             order
         }
+        0x0003_0000 => return names_from_cmap(font, num_glyphs),
+        0x0004_0000 => {
+            // decode_format_4_0: a code point per glyph, named from the AGL
+            let data = post.get(32..).unwrap_or_default();
+            if data.len() % 2 != 0 {
+                return Err("bad 'post' format 4 table".into());
+            }
+            let mut order = vec![String::new(); num_glyphs];
+            for (slot, c) in order.iter_mut().zip(data.as_chunks::<2>().0) {
+                let uv = u16::from_be_bytes(*c) as u32;
+                *slot = match uv {
+                    0xFFFF => String::new(),
+                    _ => match uv2agl(uv) {
+                        Some(name) => name.to_string(),
+                        None => format!("uni{uv:04X}"),
+                    },
+                };
+            }
+            order
+        }
         _ => {
             return Err(format!(
-                "'post' version {:#010x} has no glyph names; cmap-derived glyph names are not supported",
-                version
+                "'post' table format {} not supported",
+                crate::pyfmt::float_repr(version as f64 / 65536.0)
             )
             .into());
         }

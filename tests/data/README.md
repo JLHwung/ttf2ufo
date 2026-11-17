@@ -15,3 +15,10 @@
 - `set_order_cases.txt` and `tuple_set_cases.txt` hold CPython 3.14 set
   iteration orders (`list(set(values))`, `set(values).pop()`) for random
   inputs, used by the unit tests in `src/pyfmt.rs`.
+- `codec_cases.json` holds random byte strings and how Python decodes them
+  with each legacy name-record codec, used by the unit test in
+  `src/codecs/mod.rs`.
+- `filename_cases.json` holds glyph names and the `.glif` file names
+  fontTools 4.61.1's `userNameToFileName(name, existing, suffix=".glif")`
+  gives them in sequence (clashes, reserved names, truncation), used by the
+  unit test in `src/ufo.rs`.
