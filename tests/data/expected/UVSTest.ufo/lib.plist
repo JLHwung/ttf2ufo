@@ -1,0 +1,53 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>public.glyphOrder</key>
+    <array>
+      <string>.notdef</string>
+      <string>zero</string>
+      <string>zero.slash</string>
+      <string>Anegativesquared</string>
+      <string>Anegativesquared.text</string>
+    </array>
+    <key>public.openTypeHeadModified</key>
+    <string>2021/04/16 04:23:15</string>
+    <key>public.openTypePostUnderlinePosition</key>
+    <integer>-75</integer>
+    <key>public.truetype.instructions</key>
+    <dict>
+      <key>formatVersion</key>
+      <string>1</string>
+      <key>maxFunctionDefs</key>
+      <integer>0</integer>
+      <key>maxInstructionDefs</key>
+      <integer>0</integer>
+      <key>maxStackElements</key>
+      <integer>0</integer>
+      <key>maxStorage</key>
+      <integer>0</integer>
+      <key>maxTwilightPoints</key>
+      <integer>0</integer>
+      <key>maxZones</key>
+      <integer>1</integer>
+    </dict>
+    <key>public.unicodeVariationSequences</key>
+    <dict>
+      <key>FE00</key>
+      <dict>
+        <key>0030</key>
+        <string>zero.slash</string>
+      </dict>
+      <key>FE0E</key>
+      <dict>
+        <key>1F170</key>
+        <string>Anegativesquared.text</string>
+      </dict>
+      <key>FE0F</key>
+      <dict>
+        <key>1F170</key>
+        <string>Anegativesquared</string>
+      </dict>
+    </dict>
+  </dict>
+</plist>

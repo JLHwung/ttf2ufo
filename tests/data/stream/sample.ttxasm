@@ -1,0 +1,21 @@
+PUSHB[ ]	/* 4 values pushed */
+1 2 3 4
+PUSHW[ ]	/* 2 values pushed */
+1 -1
+PUSHW[ ]	/* 2 values pushed */
+5 512
+SPVTCA[0]	/* SetPVectorToAxis */
+SPVTCA[1]	/* SetPVectorToAxis */
+SFVTL[0]	/* SetFVectorToLine */
+SFVTL[1]	/* SetFVectorToLine */
+MDAP[0]	/* MoveDirectAbsPt */
+MDAP[1]	/* MoveDirectAbsPt */
+IF[ ]	/* If */
+  SHP[0]	/* ShiftPointByLastPoint */
+  SHC[1]	/* ShiftContourByLastPt */
+EIF[ ]	/* EndIf */
+MSIRP[1]	/* MoveStackIndirRelPt */
+MD[0]	/* MeasureDistance */
+GC[1]	/* GetCoordOnPVector */
+ROUND[01]	/* Round */
+MDRP[00110]	/* MoveDirectRelPt */
