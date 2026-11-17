@@ -81,19 +81,17 @@ fn check(font: &str, skip: &[&str]) {
     );
 }
 
-const FEATURES: &[&str] = &["features.fea"];
-
 #[test]
 fn uvs_test() {
-    check("UVSTest", FEATURES);
+    check("UVSTest", &[]);
 }
 
 #[test]
 fn ibm_plex_fl() {
-    check("IBM Plex Serif-Text-FL", FEATURES);
+    check("IBM Plex Serif-Text-FL", &[]);
 }
 
 #[test]
 fn ibm_plex_ufo2ft() {
-    check("IBM Plex Serif-Text-ufo2ft", FEATURES);
+    check("IBM Plex Serif-Text-ufo2ft", &[]);
 }
