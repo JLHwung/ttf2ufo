@@ -2,7 +2,7 @@
 
 Extract a UFO from a TrueType font, byte-for-byte as
 [ufo-extractor](https://github.com/robotools/extractor)'s `extractufo` 0.8.1
-does (fontTools 4.61, ufoLib2, fontFeatures 1.9), but much faster.
+does (fontTools 4.61, ufoLib2, fontFeatures 1.9).
 
 ```sh
 ttf2ufo Font.ttf                 # writes Font.ttf.ufo, like extractufo
@@ -62,3 +62,8 @@ extractufo's:
 `tests/data/regenerate.py` rebuilds the expected outputs from the Python
 reference implementation; see `tests/data/README.md` for where the test data
 comes from.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The test data in `tests/data` comes from
+third parties under their own licenses; see `tests/data/README.md`.
