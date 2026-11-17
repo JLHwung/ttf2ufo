@@ -9,8 +9,20 @@ pub fn float_repr(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "inf" } else { "-inf" }.into();
     }
-    // Rust's LowerExp prints the shortest round-tripping digits: "-1.2345e3".
-    let sci = format!("{value:e}");
+    // Rust's LowerExp gives the shortest round-tripping length; Python prints
+    // the correctly rounded digits of that length (ties to even), which
+    // Rust's precision formatting gives, where `{:e}` may pick another
+    // round-tripping string: -12.0243072509765625 is -12.024307250976562 in
+    // Python, -12.024307250976563 with `{:e}`.
+    let shortest = format!("{value:e}");
+    let n = shortest
+        .split_once('e')
+        .unwrap()
+        .0
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .count();
+    let sci = format!("{value:.*e}", n - 1);
     let (mantissa, exp) = sci.split_once('e').unwrap();
     let exp: i32 = exp.parse().unwrap();
     let (sign, mantissa) = match mantissa.strip_prefix('-') {
@@ -210,6 +222,8 @@ mod tests {
         assert_eq!(float_repr(0.00001), "1e-05");
         assert_eq!(float_repr(-0.6123), "-0.6123");
         assert_eq!(float_repr(0.1 + 0.2), "0.30000000000000004");
+        // a tie at 17 digits: Python rounds it to even
+        assert_eq!(float_repr(-788025.0 / 65536.0), "-12.024307250976562");
         assert_eq!(float_repr_signed(0.0), "+0.0");
         assert_eq!(float_repr_signed(-0.25), "-0.25");
     }
