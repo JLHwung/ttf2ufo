@@ -24,7 +24,10 @@ fn main() -> ExitCode {
         }
     }
     let (font, out) = match paths.as_slice() {
-        [font] => (font.clone(), PathBuf::from(format!("{}.ufo", font.display()))),
+        [font] => (
+            font.clone(),
+            PathBuf::from(format!("{}.ufo", font.display())),
+        ),
         [font, out] => (font.clone(), out.clone()),
         _ => {
             eprintln!("{USAGE}");
@@ -37,7 +40,11 @@ fn main() -> ExitCode {
         .and_then(|ufo| {
             if update {
                 let (written, removed) = ufo.sync(&out)?;
-                println!("{}: {} glyphs, {written} files written, {removed} removed", out.display(), ufo.glyphs.len());
+                println!(
+                    "{}: {} glyphs, {written} files written, {removed} removed",
+                    out.display(),
+                    ufo.glyphs.len()
+                );
             } else {
                 ufo.save(&out)?;
                 println!("{}: {} glyphs", out.display(), ufo.glyphs.len());

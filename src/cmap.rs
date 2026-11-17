@@ -67,7 +67,10 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
                         } else {
                             let index = code + partial;
                             let g = glyph_ids
-                                .get(usize::try_from(index).map_err(|_| "bad cmap format 4 index")?)
+                                .get(
+                                    usize::try_from(index)
+                                        .map_err(|_| "bad cmap format 4 index")?,
+                                )
                                 .ok_or("bad cmap format 4 index")?
                                 .get() as i64;
                             if g != 0 { (g + d) & 0xFFFF } else { 0 }
@@ -85,7 +88,11 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
             CmapSubtable::Format12(t) => {
                 for g in t.groups() {
                     for code in g.start_char_code()..=g.end_char_code() {
-                        insert(&mut map, code, g.start_glyph_id() + (code - g.start_char_code()));
+                        insert(
+                            &mut map,
+                            code,
+                            g.start_glyph_id() + (code - g.start_char_code()),
+                        );
                     }
                 }
             }
@@ -100,11 +107,19 @@ fn decode_subtables(cmap: &Cmap) -> Result<Vec<Subtable>, Error> {
             other => {
                 let unicode = platform == 0 || (platform == 3 && matches!(encoding, 0 | 1 | 10));
                 if unicode {
-                    return Err(format!("cmap subtable format {} is not supported", format_of(&other)).into());
+                    return Err(format!(
+                        "cmap subtable format {} is not supported",
+                        format_of(&other)
+                    )
+                    .into());
                 }
             }
         }
-        out.push(Subtable { platform, encoding, map });
+        out.push(Subtable {
+            platform,
+            encoding,
+            map,
+        });
     }
     Ok(out)
 }
@@ -139,7 +154,11 @@ pub struct CharMap {
 
 pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
     let Ok(cmap) = font.cmap() else {
-        return Ok(CharMap { unicodes: vec![Vec::new(); num_glyphs], best: None, uvs: Vec::new() });
+        return Ok(CharMap {
+            unicodes: vec![Vec::new(); num_glyphs],
+            best: None,
+            uvs: Vec::new(),
+        });
     };
     let subtables = decode_subtables(&cmap)?;
 
@@ -158,9 +177,21 @@ pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
         .collect();
 
     // getBestCmap preference order
-    const PREFS: [(u16, u16); 8] = [(3, 10), (0, 6), (0, 4), (3, 1), (0, 3), (0, 2), (0, 1), (0, 0)];
+    const PREFS: [(u16, u16); 8] = [
+        (3, 10),
+        (0, 6),
+        (0, 4),
+        (3, 1),
+        (0, 3),
+        (0, 2),
+        (0, 1),
+        (0, 0),
+    ];
     let best = PREFS.iter().find_map(|&(p, e)| {
-        subtables.iter().find(|t| t.platform == p && t.encoding == e).map(|t| t.map.clone())
+        subtables
+            .iter()
+            .find(|t| t.platform == p && t.encoding == e)
+            .map(|t| t.map.clone())
     });
 
     let mut uvs = Vec::new();
@@ -180,12 +211,19 @@ pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
                 }
                 if let Some(non_default) = selector.non_default_uvs(data) {
                     for mapping in non_default?.uvs_mapping() {
-                        entries.push((mapping.unicode_value().to_u32(), Some(mapping.glyph_id() as u32)));
+                        entries.push((
+                            mapping.unicode_value().to_u32(),
+                            Some(mapping.glyph_id() as u32),
+                        ));
                     }
                 }
                 uvs.push((selector.var_selector().to_u32(), entries));
             }
         }
     }
-    Ok(CharMap { unicodes, best, uvs })
+    Ok(CharMap {
+        unicodes,
+        best,
+        uvs,
+    })
 }

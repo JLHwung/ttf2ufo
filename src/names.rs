@@ -20,7 +20,9 @@ fn unpack_pstrings(data: &[u8], n: usize) -> Vec<String> {
         let length = data.get(index).map_or(0, |b| *b as usize);
         index += 1;
         let name = match data.get(index..index + length) {
-            Some(bytes) if index + length <= data.len() => bytes.iter().map(|b| *b as char).collect(),
+            Some(bytes) if index + length <= data.len() => {
+                bytes.iter().map(|b| *b as char).collect()
+            }
             _ => String::new(),
         };
         strings.push(name);
@@ -41,15 +43,25 @@ pub fn glyph_order(font: &FontRef) -> Result<Vec<String>, Error> {
     let mut order: Vec<String> = match version {
         0x0001_0000 => {
             if num_glyphs > DEFAULT_GLYPH_NAMES.len() {
-                return Err("'post' format 1 has too few names; cmap-derived glyph names are not supported".into());
+                return Err(
+                    "'post' format 1 has too few names; cmap-derived glyph names are not supported"
+                        .into(),
+                );
             }
-            DEFAULT_GLYPH_NAMES[..num_glyphs].iter().map(|s| s.to_string()).collect()
+            DEFAULT_GLYPH_NAMES[..num_glyphs]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         }
         0x0002_0000 => {
             let declared = be16(post, 32).ok_or("bad 'post' table")? as usize;
             let count = declared.min(num_glyphs);
             let indices: Vec<usize> = (0..count)
-                .map(|i| be16(post, 34 + 2 * i).map(|v| v as usize).ok_or("bad 'post' table"))
+                .map(|i| {
+                    be16(post, 34 + 2 * i)
+                        .map(|v| v as usize)
+                        .ok_or("bad 'post' table")
+                })
                 .collect::<Result<_, _>>()?;
             let max_index = indices.iter().copied().max().unwrap_or(0);
             let strings = post.get(34 + 2 * count..).unwrap_or_default();
@@ -77,7 +89,11 @@ pub fn glyph_order(font: &FontRef) -> Result<Vec<String>, Error> {
     let original: HashSet<String> = order.iter().cloned().collect();
     let mut all_names: HashMap<String, usize> = HashMap::new();
     for (i, slot) in order.iter_mut().enumerate() {
-        let mut name = if slot.is_empty() { format!("glyph{i:05}") } else { slot.clone() };
+        let mut name = if slot.is_empty() {
+            format!("glyph{i:05}")
+        } else {
+            slot.clone()
+        };
         if let Some(&n0) = all_names.get(&name) {
             let mut n = n0;
             while original.contains(&format!("{name}.{n}")) {

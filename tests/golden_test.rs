@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn data(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
 }
 
 fn read_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -17,7 +19,10 @@ fn read_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             if path.is_dir() {
                 stack.push(path);
             } else {
-                files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(&path).unwrap(),
+                );
             }
         }
     }
@@ -58,15 +63,22 @@ fn check(font: &str, skip: &[&str]) {
     for (path, content) in actual.iter().filter(|(p, _)| !skip.contains(p)) {
         match expected.get(path) {
             None => problems.push(format!("unexpected: {}", path.display())),
-            Some(e) if e != content => {
-                problems.push(format!("differs: {}\n{}", path.display(), first_difference(content, e)))
-            }
+            Some(e) if e != content => problems.push(format!(
+                "differs: {}\n{}",
+                path.display(),
+                first_difference(content, e)
+            )),
             Some(_) => {}
         }
     }
     let total = problems.len();
     problems.truncate(10);
-    assert!(total == 0, "{font}: {total} problems, first {}:\n{}", problems.len(), problems.join("\n"));
+    assert!(
+        total == 0,
+        "{font}: {total} problems, first {}:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
 }
 
 const FEATURES: &[&str] = &["features.fea"];

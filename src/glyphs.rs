@@ -84,7 +84,11 @@ pub fn extract_glyphs(
                             seg = if p.cubic { "curve" } else { "qcurve" };
                             None
                         };
-                        points.push(Point { x: p.x as i64 + offset, y: p.y as i64, typ });
+                        points.push(Point {
+                            x: p.x as i64 + offset,
+                            y: p.y as i64,
+                            typ,
+                        });
                     }
                     glyph.contours.push(points);
                 }
@@ -102,7 +106,9 @@ pub fn extract_glyphs(
                         .cloned()
                         .unwrap_or_else(|| format!("glyph{:05}", c.glyph.to_u32()));
                     let TtAnchor::Offset { x, y } = c.anchor else {
-                        return Err(format!("{name}: point-matched components are not supported").into());
+                        return Err(
+                            format!("{name}: point-matched components are not supported").into(),
+                        );
                     };
                     let f = |v: read_fonts::types::F2Dot14| Num::Float(v.to_f64());
                     let t = &c.transform;
@@ -118,7 +124,9 @@ pub fn extract_glyphs(
                     let mut flags = Dict::new();
                     flags.insert(
                         "public.truetype.roundOffsetToGrid".into(),
-                        c.flags.contains(CompositeGlyphFlags::ROUND_XY_TO_GRID).into(),
+                        c.flags
+                            .contains(CompositeGlyphFlags::ROUND_XY_TO_GRID)
+                            .into(),
                     );
                     flags.insert(
                         "public.truetype.useMyMetrics".into(),
@@ -139,9 +147,13 @@ pub fn extract_glyphs(
                         identifier: Some(identifier),
                     });
                 }
-                glyph.lib.insert("public.objectLibs".into(), Value::Dict(object_libs));
+                glyph
+                    .lib
+                    .insert("public.objectLibs".into(), Value::Dict(object_libs));
                 if !glyph.components.is_empty() {
-                    glyph.lib.insert("public.truetype.overlap".into(), overlap.into());
+                    glyph
+                        .lib
+                        .insert("public.truetype.overlap".into(), overlap.into());
                 }
             }
         }
@@ -152,11 +164,16 @@ pub fn extract_glyphs(
         {
             glyph.height = height as i64;
             if let Some(vorg) = &vorg {
-                glyph.lib.insert("public.verticalOrigin".into(), (vorg.vertical_origin_y(id) as i64).into());
+                glyph.lib.insert(
+                    "public.verticalOrigin".into(),
+                    (vorg.vertical_origin_y(id) as i64).into(),
+                );
             } else {
                 let tsb = vmtx.side_bearing(id).unwrap_or(0) as i64;
                 if let Some(y_max) = control_y_max(&glyf, &loca, id, 0)? {
-                    glyph.lib.insert("public.verticalOrigin".into(), Value::Int(tsb + y_max));
+                    glyph
+                        .lib
+                        .insert("public.verticalOrigin".into(), Value::Int(tsb + y_max));
                 }
             }
         }
@@ -165,17 +182,25 @@ pub fn extract_glyphs(
     }
 
     // extractGlyphPrograms: needs every glyph's outline for the component hash
-    let index: std::collections::HashMap<&str, usize> =
-        names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let index: std::collections::HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
     for gid in 0..num {
-        let Some(program) = &programs[gid] else { continue };
+        let Some(program) = &programs[gid] else {
+            continue;
+        };
         let mut hash_data = format!("w{}", glyphs[gid].width);
         hash_glyph(&glyphs, &index, gid, true, &mut hash_data)?;
         let id = if hash_data.len() >= 128 {
-            Sha512::digest(hash_data.as_bytes()).iter().fold(String::with_capacity(128), |mut h, b| {
-                let _ = write!(h, "{b:02x}");
-                h
-            })
+            Sha512::digest(hash_data.as_bytes()).iter().fold(
+                String::with_capacity(128),
+                |mut h, b| {
+                    let _ = write!(h, "{b:02x}");
+                    h
+                },
+            )
         } else {
             hash_data
         };
@@ -183,7 +208,10 @@ pub fn extract_glyphs(
         instructions.insert("formatVersion".into(), "1".into());
         instructions.insert("id".into(), id.into());
         instructions.insert("assembly".into(), lib_assembly(program)?.into());
-        glyphs[gid].lib.insert("public.truetype.instructions".into(), Value::Dict(instructions));
+        glyphs[gid].lib.insert(
+            "public.truetype.instructions".into(),
+            Value::Dict(instructions),
+        );
     }
     Ok(glyphs)
 }

@@ -29,7 +29,9 @@ MDRP[m<RWh]\t/* MoveDirectRelPt */
 #PUSHON";
 
 fn data(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
 }
 
 fn read_text(name: &str) -> String {
@@ -71,19 +73,28 @@ fn test_extract_vtt() {
 fn test_complex_ttx() {
     // Roundtripped sample should be identical
     let sample = read_text("stream/sample.ttxasm");
-    assert_lines(&ttx_assembly(&read_bytes("stream/sample.bin")).unwrap(), &sample);
+    assert_lines(
+        &ttx_assembly(&read_bytes("stream/sample.bin")).unwrap(),
+        &sample,
+    );
 }
 
 #[test]
 fn test_complex_vtt() {
-    assert_lines(&vtt_assembly(&read_bytes("stream/sample.bin")).unwrap(), EXPECTED_VTT);
+    assert_lines(
+        &vtt_assembly(&read_bytes("stream/sample.bin")).unwrap(),
+        EXPECTED_VTT,
+    );
 }
 
 #[test]
 fn test_illegal_ttx() {
     // Sample contains illegal flags, ttx does ignore this
     let sample = read_text("stream/sample_keyerror.ttxasm");
-    assert_eq!(ttx_assembly(&read_bytes("stream/sample_keyerror.bin")).unwrap(), sample);
+    assert_eq!(
+        ttx_assembly(&read_bytes("stream/sample_keyerror.bin")).unwrap(),
+        sample
+    );
 }
 
 #[test]

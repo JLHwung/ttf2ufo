@@ -149,7 +149,10 @@ fn lookup(opcode: u8) -> Option<(&'static str, u8, u8, &'static str)> {
 
 /// fontTools.misc.textTools.num2binary for small bit counts.
 fn num2binary(value: u8, bits: u8) -> String {
-    (0..bits).rev().map(|i| if value >> i & 1 == 1 { '1' } else { '0' }).collect()
+    (0..bits)
+        .rev()
+        .map(|i| if value >> i & 1 == 1 { '1' } else { '0' })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -188,9 +191,8 @@ fn assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
 
     while pos < bytecode.len() {
         let opcode = read_byte(&mut pos)?;
-        let (mut cmd_name, mut arg_bits, base, name) = lookup(opcode).ok_or_else(|| {
-            format!("Illegal opcode 0x{opcode:02x} at offset 0x{pos:04x}.")
-        })?;
+        let (mut cmd_name, mut arg_bits, base, name) = lookup(opcode)
+            .ok_or_else(|| format!("Illegal opcode 0x{opcode:02x} at offset 0x{pos:04x}."))?;
         if matches!(cmd_name, "EIF" | "ELSE" | "ENDF") {
             indent -= 1;
         }
@@ -217,7 +219,11 @@ fn assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
         }
 
         let arg_bitstring = if arg_bits == 0 {
-            if dialect == Dialect::Ttx { " ".to_string() } else { String::new() }
+            if dialect == Dialect::Ttx {
+                " ".to_string()
+            } else {
+                String::new()
+            }
         } else {
             let bits = num2binary(opcode - base, arg_bits);
             match dialect {
@@ -254,7 +260,9 @@ fn assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
                     asm.push_str(&format!("{end}{pad}{cmd_name}, {}", args.join(", ")));
                     asm.push_str(&format!("{end}#PUSHOFF"));
                 } else {
-                    asm.push_str(&format!("{end}{pad}{cmd_name}[{arg_bitstring}]\t/* {name} */"));
+                    asm.push_str(&format!(
+                        "{end}{pad}{cmd_name}[{arg_bitstring}]\t/* {name} */"
+                    ));
                 }
             }
         }

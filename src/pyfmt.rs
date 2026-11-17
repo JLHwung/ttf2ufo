@@ -26,7 +26,11 @@ pub fn float_repr(value: f64) -> String {
         } else if point >= n {
             format!("{}{}.0", digits, "0".repeat((point - n) as usize))
         } else {
-            format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
+            format!(
+                "{}.{}",
+                &digits[..point as usize],
+                &digits[point as usize..]
+            )
         };
         format!("{sign}{body}")
     } else {
@@ -43,7 +47,11 @@ pub fn float_repr(value: f64) -> String {
 /// Python's `f"{value:+}"` for a float (`repr` with an explicit sign).
 pub fn float_repr_signed(value: f64) -> String {
     let r = float_repr(value);
-    if r.starts_with('-') { r } else { format!("+{r}") }
+    if r.starts_with('-') {
+        r
+    } else {
+        format!("+{r}")
+    }
 }
 
 /// A number that keeps Python's int/float distinction, which matters for
@@ -121,7 +129,11 @@ pub fn py_set_order<K: Eq + Clone>(items: impl IntoIterator<Item = (u64, K)>) ->
                 }
             }
             perturb >>= PERTURB_SHIFT;
-            i = (i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize)) & mask;
+            i = (i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize))
+                & mask;
         }
     }
 
@@ -134,7 +146,11 @@ pub fn py_set_order<K: Eq + Clone>(items: impl IntoIterator<Item = (u64, K)>) ->
         let mut i = (hash as usize) & mask;
         let mut found = false;
         'probe: loop {
-            let probes = if i + LINEAR_PROBES <= mask { LINEAR_PROBES } else { 0 };
+            let probes = if i + LINEAR_PROBES <= mask {
+                LINEAR_PROBES
+            } else {
+                0
+            };
             for j in 0..=probes {
                 match &table[i + j] {
                     Some((h, k)) if *h == hash && *k == key => {
@@ -149,7 +165,11 @@ pub fn py_set_order<K: Eq + Clone>(items: impl IntoIterator<Item = (u64, K)>) ->
                 }
             }
             perturb >>= PERTURB_SHIFT;
-            i = (i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize)) & mask;
+            i = (i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize))
+                & mask;
         }
         if found {
             continue;
@@ -213,7 +233,9 @@ mod tests {
         // "inserted | list(set(inserted)) | set(inserted).pop()", from CPython 3.14
         let cases = include_str!("../tests/data/tuple_set_cases.txt");
         let parse = |s: &str| -> Vec<Vec<u64>> {
-            s.split(';').map(|t| t.split(',').map(|v| v.parse().unwrap()).collect()).collect()
+            s.split(';')
+                .map(|t| t.split(',').map(|v| v.parse().unwrap()).collect())
+                .collect()
         };
         for line in cases.lines() {
             let parts: Vec<&str> = line.split(" | ").collect();
@@ -229,7 +251,8 @@ mod tests {
         let cases = include_str!("../tests/data/set_order_cases.txt");
         for line in cases.lines() {
             let (input, expected) = line.split_once(" | ").unwrap();
-            let parse = |s: &str| -> Vec<u64> { s.split(' ').map(|v| v.parse().unwrap()).collect() };
+            let parse =
+                |s: &str| -> Vec<u64> { s.split(' ').map(|v| v.parse().unwrap()).collect() };
             assert_eq!(int_set_order(parse(input)), parse(expected), "{input}");
         }
     }

@@ -33,7 +33,10 @@ struct Names<'a>(&'a [String]);
 impl Names<'_> {
     /// fontTools' getGlyphName: out-of-range ids get "glyph%05d".
     fn get(&self, gid: u32) -> String {
-        self.0.get(gid as usize).cloned().unwrap_or_else(|| format!("glyph{gid:05}"))
+        self.0
+            .get(gid as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("glyph{gid:05}"))
     }
 }
 
@@ -43,8 +46,12 @@ fn tag_str(tag: Tag) -> String {
 
 /// `_makeScriptOrder`: script tags, sorted.
 fn script_order(gpos: &Gpos) -> Result<Vec<String>, Error> {
-    let mut scripts: Vec<String> =
-        gpos.script_list()?.script_records().iter().map(|r| tag_str(r.script_tag())).collect();
+    let mut scripts: Vec<String> = gpos
+        .script_list()?
+        .script_records()
+        .iter()
+        .map(|r| tag_str(r.script_tag()))
+        .collect();
     scripts.sort();
     Ok(scripts)
 }
@@ -128,7 +135,11 @@ fn feature_classes(
     let mut class0 = Members::new();
     if let Some(coverage) = coverage {
         if let Some(existing) = class_dict.get(&0) {
-            class0 = existing.iter().filter(|g| coverage.contains(g)).cloned().collect();
+            class0 = existing
+                .iter()
+                .filter(|g| coverage.contains(g))
+                .cloned()
+                .collect();
         } else {
             class0 = coverage.iter().cloned().collect();
             for members in class_dict.values() {
@@ -137,7 +148,10 @@ fn feature_classes(
         }
     }
     class_dict.insert(0, class0);
-    class_dict.into_iter().map(|(cls, m)| ((lookup, subtable, cls as usize), m)).collect()
+    class_dict
+        .into_iter()
+        .map(|(cls, m)| ((lookup, subtable, cls as usize), m))
+        .collect()
 }
 
 fn x_advance(record: &read_fonts::tables::gpos::ValueRecord, format_nonzero: bool) -> Option<i64> {
@@ -151,7 +165,14 @@ fn kerning_for_lookup(
     gpos: &Gpos,
     index: usize,
     names: &Names,
-) -> Result<Option<(Pairs, IndexMap<ClassId, Members>, IndexMap<ClassId, Members>)>, Error> {
+) -> Result<
+    Option<(
+        Pairs,
+        IndexMap<ClassId, Members>,
+        IndexMap<ClassId, Members>,
+    )>,
+    Error,
+> {
     let lookup = gpos.lookup_list()?.lookups().get(index)?;
     if !matches!(lookup.lookup_type(), 2 | 9) {
         return Ok(None);
@@ -165,32 +186,61 @@ fn kerning_for_lookup(
     for (si, subtable) in subtables.iter().enumerate() {
         match subtable? {
             PairPos::Format1(t) => {
-                let coverage: Vec<String> = t.coverage()?.iter().map(|g| names.get(g.to_u32())).collect();
+                let coverage: Vec<String> = t
+                    .coverage()?
+                    .iter()
+                    .map(|g| names.get(g.to_u32()))
+                    .collect();
                 let use_first = !t.value_format1().is_empty();
                 for (i, pair_set) in t.pair_sets().iter().enumerate() {
-                    let Some(left_name) = coverage.get(i) else { break };
+                    let Some(left_name) = coverage.get(i) else {
+                        break;
+                    };
                     for record in pair_set?.pair_value_records().iter() {
                         let record = record?;
-                        let value = if use_first { record.value_record1() } else { record.value_record2() };
+                        let value = if use_first {
+                            record.value_record1()
+                        } else {
+                            record.value_record2()
+                        };
                         if let Some(v) = x_advance(value, use_first) {
                             let right_name = names.get(record.second_glyph().to_u32());
-                            kerning.insert((Side::Glyph(left_name.clone()), Side::Glyph(right_name)), v);
+                            kerning.insert(
+                                (Side::Glyph(left_name.clone()), Side::Glyph(right_name)),
+                                v,
+                            );
                         }
                     }
                 }
             }
             PairPos::Format2(t) => {
-                let coverage: Vec<String> = t.coverage()?.iter().map(|g| names.get(g.to_u32())).collect();
-                let l = feature_classes(index, si, &class_defs(&t.class_def1()?, names), Some(&coverage));
+                let coverage: Vec<String> = t
+                    .coverage()?
+                    .iter()
+                    .map(|g| names.get(g.to_u32()))
+                    .collect();
+                let l = feature_classes(
+                    index,
+                    si,
+                    &class_defs(&t.class_def1()?, names),
+                    Some(&coverage),
+                );
                 let r = feature_classes(index, si, &class_defs(&t.class_def2()?, names), None);
                 let use_first = !t.value_format1().is_empty();
                 for (c1, class1) in t.class1_records().iter().enumerate() {
                     let class1 = class1?;
                     for (c2, class2) in class1.class2_records().iter().enumerate() {
                         let class2 = class2?;
-                        let value = if use_first { class2.value_record1() } else { class2.value_record2() };
+                        let value = if use_first {
+                            class2.value_record1()
+                        } else {
+                            class2.value_record2()
+                        };
                         if let Some(v) = x_advance(value, use_first).filter(|v| *v != 0) {
-                            kerning.insert((Side::Class((index, si, c1)), Side::Class((index, si, c2))), v);
+                            kerning.insert(
+                                (Side::Class((index, si, c1)), Side::Class((index, si, c2))),
+                                v,
+                            );
                         }
                     }
                 }
@@ -205,7 +255,9 @@ fn kerning_for_lookup(
 }
 
 /// `_findSingleMemberGroups`: removes one-glyph classes, returning them.
-fn find_single_member_groups(groups: &mut [Vec<IndexMap<ClassId, Members>>]) -> HashMap<ClassId, String> {
+fn find_single_member_groups(
+    groups: &mut [Vec<IndexMap<ClassId, Members>>],
+) -> HashMap<ClassId, String> {
     let mut singles = HashMap::new();
     for group in groups.iter_mut() {
         for dict in group.iter_mut() {
@@ -222,7 +274,11 @@ fn find_single_member_groups(groups: &mut [Vec<IndexMap<ClassId, Members>>]) -> 
     singles
 }
 
-fn rename_pairs(kerning: Pairs, left: &HashMap<ClassId, Side>, right: &HashMap<ClassId, Side>) -> Pairs {
+fn rename_pairs(
+    kerning: Pairs,
+    left: &HashMap<ClassId, Side>,
+    right: &HashMap<ClassId, Side>,
+) -> Pairs {
     let map = |side: Side, rename: &HashMap<ClassId, Side>| match side {
         Side::Class(id) => rename.get(&id).cloned().unwrap_or(Side::Class(id)),
         other => other,
@@ -236,7 +292,9 @@ fn rename_pairs(kerning: Pairs, left: &HashMap<ClassId, Side>, right: &HashMap<C
 
 /// `_mergeClasses`: classes in first-seen order, and the rename map of
 /// classes merged into an identical one.
-fn merge_classes(groups: &[Vec<IndexMap<ClassId, Members>>]) -> (IndexMap<ClassId, Members>, HashMap<ClassId, Side>) {
+fn merge_classes(
+    groups: &[Vec<IndexMap<ClassId, Members>>],
+) -> (IndexMap<ClassId, Members>, HashMap<ClassId, Side>) {
     let mut tree: IndexMap<Members, Vec<ClassId>> = IndexMap::new();
     for group in groups {
         for dict in group {
@@ -253,7 +311,8 @@ fn merge_classes(groups: &[Vec<IndexMap<ClassId, Members>>]) -> (IndexMap<ClassI
     for (members, ids) in tree {
         // names.pop() on a Python set of tuples
         let order = py_set_order(
-            ids.iter().map(|id| (tuple_hash(&[id.0 as u64, id.1 as u64, id.2 as u64]), *id)),
+            ids.iter()
+                .map(|id| (tuple_hash(&[id.0 as u64, id.1 as u64, id.2 as u64]), *id)),
         );
         let keep = order[0];
         for other in &order[1..] {
@@ -303,7 +362,11 @@ pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, 
         let mut right_dicts: Vec<Vec<IndexMap<ClassId, Members>>> = Vec::new();
         for script in script_order(&gpos)? {
             let (mut k, mut l, mut r) = (Vec::new(), Vec::new(), Vec::new());
-            for &index in lookup_indexes.get(&script).map(Vec::as_slice).unwrap_or_default() {
+            for &index in lookup_indexes
+                .get(&script)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
                 if !seen.insert(index) {
                     continue;
                 }
@@ -349,13 +412,19 @@ pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, 
         let left_rename = rename_classes(&left_classes, "public.kern1.");
         let right_rename = rename_classes(&right_classes, "public.kern2.");
         kerning = rename_pairs(kerning, &left_rename, &right_rename);
-        for (classes, rename) in [(&left_classes, &left_rename), (&right_classes, &right_rename)] {
+        for (classes, rename) in [
+            (&left_classes, &left_rename),
+            (&right_classes, &right_rename),
+        ] {
             for (id, glyphs) in classes {
                 if glyphs.len() == 1 {
                     continue;
                 }
                 let name = side_name(&rename.get(id).cloned().unwrap_or(Side::Class(*id)))?;
-                groups.insert(name, Value::Array(glyphs.iter().map(|g| g.clone().into()).collect()));
+                groups.insert(
+                    name,
+                    Value::Array(glyphs.iter().map(|g| g.clone().into()).collect()),
+                );
             }
         }
     }
@@ -380,7 +449,9 @@ pub fn extract_kerning(font: &FontRef, glyph_names: &[String]) -> Result<(Dict, 
 /// `_extractOpenTypeKerningFromKern`: format 0 subtables of a version 0 'kern' table.
 fn kern_table(d: &[u8], names: &Names) -> Result<Pairs, Error> {
     let u16_at = |at: usize| -> Result<u16, Error> {
-        Ok(u16::from_be_bytes(d.get(at..at + 2).ok_or("bad 'kern' table")?.try_into()?))
+        Ok(u16::from_be_bytes(
+            d.get(at..at + 2).ok_or("bad 'kern' table")?.try_into()?,
+        ))
     };
     if u16_at(0)? != 0 {
         return Err("only version 0 'kern' tables are supported".into());
@@ -397,7 +468,10 @@ fn kern_table(d: &[u8], names: &Names) -> Result<Pairs, Error> {
             let p = at + 14 + 6 * i;
             let value = u16_at(p + 4)? as i16 as i64;
             pairs.insert(
-                (Side::Glyph(names.get(u16_at(p)? as u32)), Side::Glyph(names.get(u16_at(p + 2)? as u32))),
+                (
+                    Side::Glyph(names.get(u16_at(p)? as u32)),
+                    Side::Glyph(names.get(u16_at(p + 2)? as u32)),
+                ),
                 value,
             );
         }
@@ -423,16 +497,25 @@ fn grow(groups: &mut Vec<AnchorGroup>, len: usize) {
 }
 
 /// `extractAnchors`: glyph name -> anchors to append, in order.
-pub fn extract_anchors(font: &FontRef, glyph_names: &[String]) -> Result<IndexMap<String, Vec<Anchor>>, Error> {
+pub fn extract_anchors(
+    font: &FontRef,
+    glyph_names: &[String],
+) -> Result<IndexMap<String, Vec<Anchor>>, Error> {
     let names = Names(glyph_names);
     let mut out: IndexMap<String, Vec<Anchor>> = IndexMap::new();
-    let Ok(gpos) = font.gpos() else { return Ok(out) };
+    let Ok(gpos) = font.gpos() else {
+        return Ok(out);
+    };
     let lookup_indexes = gather_lookup_indexes(&gpos, &["mark", "mkmk"])?;
     let lookups = gpos.lookup_list()?.lookups();
     let mut seen = std::collections::HashSet::new();
     let mut all: Vec<AnchorGroup> = Vec::new();
     for script in script_order(&gpos)? {
-        for &index in lookup_indexes.get(&script).map(Vec::as_slice).unwrap_or_default() {
+        for &index in lookup_indexes
+            .get(&script)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
             if !seen.insert(index) {
                 continue;
             }
@@ -448,15 +531,29 @@ pub fn extract_anchors(font: &FontRef, glyph_names: &[String]) -> Result<IndexMa
                             continue;
                         };
                         let mut groups: Vec<AnchorGroup> = Vec::new();
-                        let base_cov: Vec<String> = t.base_coverage()?.iter().map(|g| names.get(g.to_u32())).collect();
-                        let mark_cov: Vec<String> = t.mark_coverage()?.iter().map(|g| names.get(g.to_u32())).collect();
+                        let base_cov: Vec<String> = t
+                            .base_coverage()?
+                            .iter()
+                            .map(|g| names.get(g.to_u32()))
+                            .collect();
+                        let mark_cov: Vec<String> = t
+                            .mark_coverage()?
+                            .iter()
+                            .map(|g| names.get(g.to_u32()))
+                            .collect();
                         let base_array = t.base_array()?;
                         for (ri, record) in base_array.base_records().iter().enumerate() {
                             let record = record?;
-                            for (ai, anchor) in record.base_anchors(base_array.offset_data()).iter().enumerate() {
+                            for (ai, anchor) in record
+                                .base_anchors(base_array.offset_data())
+                                .iter()
+                                .enumerate()
+                            {
                                 grow(&mut groups, ai + 1);
                                 if let Some(anchor) = anchor {
-                                    groups[ai].0.insert(base_cov[ri].clone(), anchor_xy(&anchor?));
+                                    groups[ai]
+                                        .0
+                                        .insert(base_cov[ri].clone(), anchor_xy(&anchor?));
                                 }
                             }
                         }
@@ -466,7 +563,9 @@ pub fn extract_anchors(font: &FontRef, glyph_names: &[String]) -> Result<IndexMa
                             grow(&mut groups, class + 1);
                             let anchor = record.mark_anchor(mark_array.offset_data())?;
                             if let AnchorTable::Format1(_) = anchor {
-                                groups[class].1.insert(mark_cov[mi].clone(), anchor_xy(&anchor));
+                                groups[class]
+                                    .1
+                                    .insert(mark_cov[mi].clone(), anchor_xy(&anchor));
                             } else {
                                 eprintln!("  Unexpected markAnchor format.");
                             }
@@ -481,15 +580,29 @@ pub fn extract_anchors(font: &FontRef, glyph_names: &[String]) -> Result<IndexMa
                             continue;
                         };
                         let mut groups: Vec<AnchorGroup> = Vec::new();
-                        let base_cov: Vec<String> = t.mark2_coverage()?.iter().map(|g| names.get(g.to_u32())).collect();
-                        let mark_cov: Vec<String> = t.mark1_coverage()?.iter().map(|g| names.get(g.to_u32())).collect();
+                        let base_cov: Vec<String> = t
+                            .mark2_coverage()?
+                            .iter()
+                            .map(|g| names.get(g.to_u32()))
+                            .collect();
+                        let mark_cov: Vec<String> = t
+                            .mark1_coverage()?
+                            .iter()
+                            .map(|g| names.get(g.to_u32()))
+                            .collect();
                         let base_array = t.mark2_array()?;
                         for (ri, record) in base_array.mark2_records().iter().enumerate() {
                             let record = record?;
-                            for (ai, anchor) in record.mark2_anchors(base_array.offset_data()).iter().enumerate() {
+                            for (ai, anchor) in record
+                                .mark2_anchors(base_array.offset_data())
+                                .iter()
+                                .enumerate()
+                            {
                                 grow(&mut groups, ai + 1);
                                 if let Some(anchor) = anchor {
-                                    groups[ai].0.insert(base_cov[ri].clone(), anchor_xy(&anchor?));
+                                    groups[ai]
+                                        .0
+                                        .insert(base_cov[ri].clone(), anchor_xy(&anchor?));
                                 }
                             }
                         }
@@ -499,7 +612,9 @@ pub fn extract_anchors(font: &FontRef, glyph_names: &[String]) -> Result<IndexMa
                             grow(&mut groups, class + 1);
                             let anchor = record.mark_anchor(mark_array.offset_data())?;
                             if let AnchorTable::Format1(_) = anchor {
-                                groups[class].1.insert(mark_cov[mi].clone(), anchor_xy(&anchor));
+                                groups[class]
+                                    .1
+                                    .insert(mark_cov[mi].clone(), anchor_xy(&anchor));
                             } else {
                                 eprintln!("  Unexpected markAnchor format.");
                             }
@@ -513,10 +628,18 @@ pub fn extract_anchors(font: &FontRef, glyph_names: &[String]) -> Result<IndexMa
     }
     for (gi, (bases, marks)) in all.iter().enumerate() {
         for (glyph, (x, y)) in bases {
-            out.entry(glyph.clone()).or_default().push(Anchor { x: *x, y: *y, name: format!("Anchor-{gi}") });
+            out.entry(glyph.clone()).or_default().push(Anchor {
+                x: *x,
+                y: *y,
+                name: format!("Anchor-{gi}"),
+            });
         }
         for (glyph, (x, y)) in marks {
-            out.entry(glyph.clone()).or_default().push(Anchor { x: *x, y: *y, name: format!("_Anchor-{gi}") });
+            out.entry(glyph.clone()).or_default().push(Anchor {
+                x: *x,
+                y: *y,
+                name: format!("_Anchor-{gi}"),
+            });
         }
     }
     Ok(out)

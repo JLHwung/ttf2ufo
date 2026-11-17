@@ -64,7 +64,12 @@ impl Glyph {
     pub fn to_glif(&self) -> String {
         let mut s = String::with_capacity(4096);
         s.push_str("<?xml version='1.0' encoding='UTF-8'?>\n");
-        writeln!(s, "<glyph name=\"{}\" format=\"2\">", escape_attr(&self.name)).unwrap();
+        writeln!(
+            s,
+            "<glyph name=\"{}\" format=\"2\">",
+            escape_attr(&self.name)
+        )
+        .unwrap();
         match (self.width, self.height) {
             (0, 0) => {}
             (w, 0) => writeln!(s, "  <advance width=\"{w}\"/>").unwrap(),
@@ -78,21 +83,32 @@ impl Glyph {
             }
         }
         for a in &self.anchors {
-            writeln!(s, "  <anchor x=\"{}\" y=\"{}\" name=\"{}\"/>", a.x, a.y, escape_attr(&a.name)).unwrap();
+            writeln!(
+                s,
+                "  <anchor x=\"{}\" y=\"{}\" name=\"{}\"/>",
+                a.x,
+                a.y,
+                escape_attr(&a.name)
+            )
+            .unwrap();
         }
         s.push_str("  <outline>\n");
         for contour in &self.contours {
             s.push_str("    <contour>\n");
             for p in contour {
                 match p.typ {
-                    Some(t) => writeln!(s, "      <point x=\"{}\" y=\"{}\" type=\"{t}\"/>", p.x, p.y),
+                    Some(t) => {
+                        writeln!(s, "      <point x=\"{}\" y=\"{}\" type=\"{t}\"/>", p.x, p.y)
+                    }
                     None => writeln!(s, "      <point x=\"{}\" y=\"{}\"/>", p.x, p.y),
                 }
                 .unwrap();
             }
             s.push_str("    </contour>\n");
         }
-        const NAMES: [&str; 6] = ["xScale", "xyScale", "yxScale", "yScale", "xOffset", "yOffset"];
+        const NAMES: [&str; 6] = [
+            "xScale", "xyScale", "yxScale", "yScale", "xOffset", "yOffset",
+        ];
         const DEFAULTS: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         for c in &self.components {
             write!(s, "    <component base=\"{}\"", escape_attr(&c.base)).unwrap();
@@ -119,7 +135,9 @@ impl Glyph {
 
 /// fontTools.misc.filenames.userNameToFileName with suffix ".glif".
 pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> String {
-    const ILLEGAL: &[char] = &['"', '*', '+', '/', ':', '<', '>', '?', '[', '\\', ']', '|', '\0'];
+    const ILLEGAL: &[char] = &[
+        '"', '*', '+', '/', ':', '<', '>', '?', '[', '\\', ']', '|', '\0',
+    ];
     const RESERVED: &[&str] = &[
         "con", "prn", "aux", "clock$", "nul", "a:-z:", "com1", "lpt1", "lpt2", "lpt3", "com2",
         "com3", "com4",
@@ -195,12 +213,21 @@ impl Ufo {
         meta.insert("creator".into(), "com.github.fonttools.ufoLib".into());
         meta.insert("formatVersion".into(), 3.into());
         put("metainfo.plist", plist::to_file(&Value::Dict(meta)));
-        put("fontinfo.plist", plist::to_file(&Value::Dict(self.info.clone())));
+        put(
+            "fontinfo.plist",
+            plist::to_file(&Value::Dict(self.info.clone())),
+        );
         if !self.groups.is_empty() {
-            put("groups.plist", plist::to_file(&Value::Dict(self.groups.clone())));
+            put(
+                "groups.plist",
+                plist::to_file(&Value::Dict(self.groups.clone())),
+            );
         }
         if !self.kerning.is_empty() {
-            put("kerning.plist", plist::to_file(&Value::Dict(self.kerning.clone())));
+            put(
+                "kerning.plist",
+                plist::to_file(&Value::Dict(self.kerning.clone())),
+            );
         }
         if !self.features.is_empty() {
             put("features.fea", self.features.clone());
@@ -210,17 +237,26 @@ impl Ufo {
         }
         put(
             "layercontents.plist",
-            plist::to_file(&Value::Array(vec![Value::Array(vec!["public.default".into(), "glyphs".into()])])),
+            plist::to_file(&Value::Array(vec![Value::Array(vec![
+                "public.default".into(),
+                "glyphs".into(),
+            ])])),
         );
 
         let mut existing = HashSet::new();
-        let file_names: Vec<String> =
-            self.glyphs.iter().map(|g| glyph_file_name(&g.name, &mut existing)).collect();
+        let file_names: Vec<String> = self
+            .glyphs
+            .iter()
+            .map(|g| glyph_file_name(&g.name, &mut existing))
+            .collect();
         let mut contents = Dict::new();
         for (g, f) in self.glyphs.iter().zip(&file_names) {
             contents.insert(g.name.clone(), f.clone().into());
         }
-        put("glyphs/contents.plist", plist::to_file(&Value::Dict(contents)));
+        put(
+            "glyphs/contents.plist",
+            plist::to_file(&Value::Dict(contents)),
+        );
         let rendered: Vec<(PathBuf, Vec<u8>)> = self
             .glyphs
             .par_iter()
