@@ -1,6 +1,7 @@
 //! Port of `FontFeatures.asFeaAST()` (fontFeatures/feaLib) together with the
 //! `asFea()` serialisation of the fontTools.feaLib.ast nodes it builds.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
@@ -260,12 +261,19 @@ struct FeaState {
 impl FeaState {
     /// `FontFeatures.getNamedClassFor`
     fn get_named_class_for(&mut self, glyphs: Vec<String>, name: String) -> String {
-        let mut sorted = glyphs.clone();
-        sorted.sort();
-        if let Some(k) = self.named_by_sorted.get(&sorted) {
+        let sorted: Cow<[String]> = if glyphs.is_sorted() {
+            Cow::Borrowed(&glyphs)
+        } else {
+            let mut sorted = glyphs.clone();
+            // equal strings are indistinguishable, so unstable is fine
+            sorted.sort_unstable();
+            Cow::Owned(sorted)
+        };
+        if let Some(k) = self.named_by_sorted.get(sorted.as_ref()) {
             return k.clone();
         }
-        self.named_by_sorted.insert(sorted, name.clone());
+        self.named_by_sorted
+            .insert(sorted.into_owned(), name.clone());
         self.named_classes.push((name.clone(), glyphs));
         name
     }
@@ -293,8 +301,9 @@ impl FeaState {
     fn replace_long_with_classes(&mut self, slots: &mut [Slot]) {
         for slot in slots.iter_mut() {
             if slot.len() > 5 {
-                let mut sorted = slot.clone();
-                sorted.sort();
+                // the slot is replaced by the class reference below
+                let mut sorted = std::mem::take(slot);
+                sorted.sort_unstable();
                 let name = format!("class{}", self.chain_gensym());
                 let classname = self.get_named_class_for(sorted, name);
                 *slot = vec![format!("@{classname}")];

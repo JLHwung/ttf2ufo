@@ -137,19 +137,45 @@ const INSTRUCTIONS: &[(u8, &str, u8, &str)] = &[
     (0x42, "WS", 0, "WriteStore"),
 ];
 
-/// Look up an opcode: (mnemonic, argBits, base opcode, name).
-fn lookup(opcode: u8) -> Option<(&'static str, u8, u8, &'static str)> {
-    // fontTools checks the stream (push) instructions first.
-    for table in [STREAM_INSTRUCTIONS, INSTRUCTIONS] {
-        for &(base, mnemonic, arg_bits, name) in table {
-            let span = 1u16 << arg_bits;
-            if (base as u16..base as u16 + span).contains(&(opcode as u16)) {
-                return Some((mnemonic, arg_bits, base, name));
-            }
-        }
-    }
-    None
+/// One opcode's instruction: what fontTools' `opcodeDict` maps it to.
+#[derive(Clone, Copy)]
+struct Op {
+    mnemonic: &'static str,
+    arg_bits: u8,
+    base: u8,
+    name: &'static str,
 }
+
+/// Every opcode's instruction, built at compile time from the tables above.
+/// fontTools checks the stream (push) instructions first, so they win.
+const OPCODES: [Option<Op>; 256] = {
+    let mut ops: [Option<Op>; 256] = [None; 256];
+    let tables = [STREAM_INSTRUCTIONS, INSTRUCTIONS];
+    let mut t = 0;
+    while t < tables.len() {
+        let table = tables[t];
+        let mut i = 0;
+        while i < table.len() {
+            let (base, mnemonic, arg_bits, name) = table[i];
+            let mut k = 0usize;
+            while k < 1 << arg_bits {
+                let opcode = base as usize + k;
+                if opcode < 256 && ops[opcode].is_none() {
+                    ops[opcode] = Some(Op {
+                        mnemonic,
+                        arg_bits,
+                        base,
+                        name,
+                    });
+                }
+                k += 1;
+            }
+            i += 1;
+        }
+        t += 1;
+    }
+    ops
+};
 
 /// fontTools.misc.textTools.num2binary for small bit counts.
 fn num2binary(value: u8, bits: u8) -> String {
@@ -217,16 +243,44 @@ pub fn font_lib(font: &FontRef) -> Result<Dict, Error> {
     Ok(tt)
 }
 
-/// What ufo-extractor stores in `public.truetype.instructions` for a program.
+/// What ufo-extractor stores in `public.truetype.instructions` for a program:
+/// the TTX assembly between newlines.
 pub fn lib_assembly(bytecode: &[u8]) -> Result<String, Error> {
-    Ok(format!("\n{}\n", ttx_assembly(bytecode)?))
+    let mut asm = raw_assembly(bytecode, Dialect::Ttx)?;
+    let trimmed = asm.trim();
+    // Usually only the leading newline is trimmed: append in place.
+    if !trimmed.is_empty() && trimmed.len() + 1 == asm.len() && asm.starts_with('\n') {
+        asm.push('\n');
+        Ok(asm)
+    } else {
+        Ok(format!("\n{trimmed}\n"))
+    }
 }
 
 fn assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
-    let end = "\n";
-    let mut asm = String::new();
+    let asm = raw_assembly(bytecode, dialect)?;
+    let asm = asm.trim();
+    Ok(match dialect {
+        Dialect::Ttx => asm.to_string(),
+        Dialect::Vtt if asm.is_empty() => String::new(),
+        Dialect::Vtt => format!("#PUSHOFF\n{asm}\n#PUSHON"),
+    })
+}
+
+/// The assembly before extractor's `strip()`: each instruction starts with
+/// a newline.
+fn raw_assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
+    // Two spaces per level of indentation.
+    fn pad(asm: &mut String, indent: i32) {
+        for _ in 0..indent.max(0) {
+            asm.push_str("  ");
+        }
+    }
+    let mut asm = String::with_capacity(bytecode.len() * 24);
     let mut indent: i32 = 0;
     let mut pos = 0usize;
+    let mut args: Vec<i32> = Vec::new();
+    let mut num = itoa::Buffer::new();
     let read_byte = |pos: &mut usize| -> Result<u8, Error> {
         let b = *bytecode.get(*pos).ok_or("truncated instruction stream")?;
         *pos += 1;
@@ -235,78 +289,96 @@ fn assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
 
     while pos < bytecode.len() {
         let opcode = read_byte(&mut pos)?;
-        let (mut cmd_name, mut arg_bits, base, name) = lookup(opcode)
+        let op = OPCODES[opcode as usize]
             .ok_or_else(|| format!("Illegal opcode 0x{opcode:02x} at offset 0x{pos:04x}."))?;
+        let cmd_name = op.mnemonic;
+        let mut arg_bits = op.arg_bits;
         if matches!(cmd_name, "EIF" | "ELSE" | "ENDF") {
             indent -= 1;
         }
-        let pad = "  ".repeat(indent.max(0) as usize);
 
         let is_push = matches!(cmd_name, "NPUSHB" | "NPUSHW" | "PUSHB" | "PUSHW");
-        let mut args: Vec<String> = Vec::new();
+        args.clear();
         if is_push {
             let num_args = if cmd_name.starts_with("PUSH") {
-                (opcode - base) as usize + 1
+                (opcode - op.base) as usize + 1
             } else {
                 read_byte(&mut pos)? as usize
             };
             for _ in 0..num_args {
                 if cmd_name.ends_with('B') {
-                    args.push(read_byte(&mut pos)?.to_string());
+                    args.push(read_byte(&mut pos)? as i32);
                 } else {
                     let hi = read_byte(&mut pos)?;
                     let lo = read_byte(&mut pos)?;
-                    args.push(i16::from_be_bytes([hi, lo]).to_string());
+                    args.push(i16::from_be_bytes([hi, lo]) as i32);
                 }
             }
             arg_bits = 0; // no bits for push instructions
         }
 
-        let arg_bitstring = if arg_bits == 0 {
-            if dialect == Dialect::Ttx {
-                " ".to_string()
-            } else {
-                String::new()
-            }
-        } else {
-            let bits = num2binary(opcode - base, arg_bits);
-            match dialect {
-                Dialect::Ttx => bits,
-                Dialect::Vtt => bitstring_to_mnemonic(cmd_name, &bits)?,
-            }
-        };
-
         match dialect {
             Dialect::Ttx => {
-                if is_push {
-                    let val = if args.len() == 1 { "value" } else { "values" };
-                    asm.push_str(&format!(
-                        "\n{pad}{cmd_name}[{arg_bitstring}]\t/* {} {val} pushed */",
-                        args.len()
-                    ));
+                // "\n{pad}{cmd}[{bits}]\t/* {name} */", then "\n{pad}{args}"
+                asm.push('\n');
+                pad(&mut asm, indent);
+                asm.push_str(cmd_name);
+                asm.push('[');
+                if arg_bits == 0 {
+                    asm.push(' ');
                 } else {
-                    asm.push_str(&format!("\n{pad}{cmd_name}[{arg_bitstring}]\t/* {name} */"));
+                    let value = opcode - op.base;
+                    for i in (0..arg_bits).rev() {
+                        asm.push(if value >> i & 1 == 1 { '1' } else { '0' });
+                    }
+                }
+                asm.push_str("]\t/* ");
+                if is_push {
+                    asm.push_str(num.format(args.len()));
+                    asm.push_str(if args.len() == 1 {
+                        " value pushed */"
+                    } else {
+                        " values pushed */"
+                    });
+                } else {
+                    asm.push_str(op.name);
+                    asm.push_str(" */");
                 }
                 if !args.is_empty() {
-                    asm.push_str(&format!("\n{pad}{}", args.join(" ")));
+                    asm.push('\n');
+                    pad(&mut asm, indent);
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            asm.push(' ');
+                        }
+                        asm.push_str(num.format(*a));
+                    }
                 }
             }
             Dialect::Vtt => {
+                let pad = "  ".repeat(indent.max(0) as usize);
+                let join = |args: &[i32]| -> String {
+                    args.iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 if is_push {
-                    cmd_name = "#PUSH";
-                    asm.push_str(&format!("{end}{pad}{cmd_name}, {}", args.join(", ")));
+                    asm.push_str(&format!("\n{pad}#PUSH, {}", join(&args)));
                 } else if matches!(cmd_name, "JMPR" | "JROF") {
-                    // extractor checks for a misspelled "JPMR", so JMPR keeps no args
-                    if cmd_name == "JROF" {
-                        args = vec!["*".into(), "*".into()];
-                    }
-                    asm.push_str(&format!("{end}#PUSHON"));
-                    asm.push_str(&format!("{end}{pad}{cmd_name}, {}", args.join(", ")));
-                    asm.push_str(&format!("{end}#PUSHOFF"));
+                    // extractor checks for a misspelled "JPMR", so JMPR keeps no
+                    // args; JROF gets two placeholders
+                    let args = if cmd_name == "JROF" { "*, *" } else { "" };
+                    asm.push_str("\n#PUSHON");
+                    asm.push_str(&format!("\n{pad}{cmd_name}, {args}"));
+                    asm.push_str("\n#PUSHOFF");
                 } else {
-                    asm.push_str(&format!(
-                        "{end}{pad}{cmd_name}[{arg_bitstring}]\t/* {name} */"
-                    ));
+                    let bits = if arg_bits == 0 {
+                        String::new()
+                    } else {
+                        bitstring_to_mnemonic(cmd_name, &num2binary(opcode - op.base, arg_bits))?
+                    };
+                    asm.push_str(&format!("\n{pad}{cmd_name}[{bits}]\t/* {} */", op.name));
                 }
             }
         }
@@ -315,13 +387,7 @@ fn assembly(bytecode: &[u8], dialect: Dialect) -> Result<String, Error> {
             indent += 1;
         }
     }
-
-    let asm = asm.trim();
-    Ok(match dialect {
-        Dialect::Ttx => asm.to_string(),
-        Dialect::Vtt if asm.is_empty() => String::new(),
-        Dialect::Vtt => format!("#PUSHOFF{end}{asm}{end}#PUSHON"),
-    })
+    Ok(asm)
 }
 
 fn bitstring_to_mnemonic(cmd_name: &str, bits: &str) -> Result<String, Error> {

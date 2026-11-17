@@ -207,7 +207,8 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
             filtered.push('_');
         } else {
             filtered.push(c);
-            if c.to_lowercase().collect::<String>() != c.to_string() {
+            // `character != character.lower()`, without allocating
+            if !c.to_lowercase().eq(std::iter::once(c)) {
                 filtered.push('_');
             }
         }
@@ -226,7 +227,8 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
         .collect::<Vec<_>>()
         .join(".");
     let mut file = format!("{base}{SUFFIX}");
-    if existing_lower.contains(&file.to_lowercase()) {
+    let mut file_lower = file.to_lowercase();
+    if existing_lower.contains(&file_lower) {
         // handleClash1: room for a 15-digit counter between name and suffix
         let len = base.chars().count();
         if len + SUFFIX.len() + 15 > 255 {
@@ -235,14 +237,16 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
         let mut n = 1u64;
         loop {
             let cand = format!("{base}{n:015}{SUFFIX}");
-            if !existing_lower.contains(&cand.to_lowercase()) {
+            let cand_lower = cand.to_lowercase();
+            if !existing_lower.contains(&cand_lower) {
                 file = cand;
+                file_lower = cand_lower;
                 break;
             }
             n += 1;
         }
     }
-    existing_lower.insert(file.to_lowercase());
+    existing_lower.insert(file_lower);
     file
 }
 
