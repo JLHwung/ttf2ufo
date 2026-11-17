@@ -1,5 +1,37 @@
 //! Extract a UFO from a TrueType font, byte-for-byte as ufo-extractor's
 //! `extractufo` (fontTools / ufoLib2) does.
+//!
+//! [`extract`] reads the font into an in-memory [`Ufo`], which can then be
+//! written as a new UFO package or used to update an existing one:
+//!
+//! ```no_run
+//! use std::path::Path;
+//!
+//! # fn main() -> Result<(), ttf2ufo::Error> {
+//! let data = std::fs::read("Font.ttf")?;
+//! let ufo = ttf2ufo::extract(&data)?;
+//! println!("{} glyphs", ufo.glyphs.len());
+//!
+//! // Write a new UFO; fails if the path exists.
+//! ufo.save(Path::new("Font.ttf.ufo"))?;
+//!
+//! // Or update an existing UFO, rewriting only files that changed.
+//! let (written, removed) = ufo.sync(Path::new("Font.ufo"))?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`Ufo::to_files`] returns every file of the package without touching the
+//! disk.
+//!
+//! The other modules hold the extraction steps, named after the extractor
+//! functions they port, and the formatting helpers that reproduce Python's
+//! output exactly. Fonts that would need behavior this crate does not
+//! implement, such as CFF outlines or legacy name encodings, make
+//! [`extract`] return an error instead of producing different output; the
+//! README lists them.
+
+#![warn(missing_docs)]
 
 pub mod cmap;
 pub mod features;

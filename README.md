@@ -18,6 +18,25 @@ are removed. Unchanged files keep their mtime, so git does not re-hash them.
 
 Set `TTF2UFO_TIMING=1` to print how long each stage takes.
 
+## Install
+
+```sh
+cargo install ttf2ufo
+```
+
+## Library
+
+The crate is also a library. `ttf2ufo::extract` turns font data into an
+in-memory `Ufo`, which `save` writes as a new package and `sync` uses to
+update an existing one:
+
+```rust
+let ufo = ttf2ufo::extract(&std::fs::read("Font.ttf")?)?;
+ufo.save(std::path::Path::new("Font.ttf.ufo"))?;
+```
+
+See the API documentation (`cargo doc --open`) for the rest.
+
 ## What is extracted
 
 Everything `extractufo` writes for a TrueType font:

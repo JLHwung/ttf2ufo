@@ -11,42 +11,65 @@ use crate::Error;
 use crate::plist::{self, Dict, Value, escape_attr};
 use crate::pyfmt::Num;
 
+/// A contour point in font units.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Point {
+    /// Horizontal position.
     pub x: i64,
+    /// Vertical position.
     pub y: i64,
     /// Segment type; `None` for off-curve points.
     pub typ: Option<&'static str>,
 }
 
+/// A reference to another glyph, placed with an affine transformation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Component {
+    /// Name of the referenced glyph.
     pub base: String,
     /// (xScale, xyScale, yxScale, yScale, xOffset, yOffset)
     pub transform: [Num; 6],
+    /// The component's identifier, the key of its entry in the glyph lib's
+    /// `public.objectLibs`.
     pub identifier: Option<String>,
 }
 
+/// A named anchor point, taken from GPOS mark attachment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Anchor {
+    /// Horizontal position.
     pub x: i64,
+    /// Vertical position.
     pub y: i64,
+    /// Anchor name: `Anchor-N` on base glyphs and `_Anchor-N` on marks, where
+    /// N numbers the anchor groups, as extractor names them.
     pub name: String,
 }
 
+/// A glyph of the default layer, written as one `.glif` file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Glyph {
+    /// Glyph name.
     pub name: String,
+    /// Advance width.
     pub width: i64,
+    /// Advance height, from `vmtx`; 0 when the font has none.
     pub height: i64,
+    /// Code points mapped to this glyph, in the order extractor lists them.
     pub unicodes: Vec<u32>,
+    /// Anchors, in the order they are written.
     pub anchors: Vec<Anchor>,
+    /// Closed contours; each is a list of points.
     pub contours: Vec<Vec<Point>>,
+    /// Components, written after the contours.
     pub components: Vec<Component>,
+    /// The glyph's `lib`, such as `public.objectLibs`, `public.truetype.overlap`
+    /// and `public.truetype.instructions`.
     pub lib: Dict,
 }
 
 impl Glyph {
+    /// An empty glyph with the given name and advance width.
     pub fn new(name: String, width: i64) -> Self {
         Glyph {
             name,
@@ -196,16 +219,22 @@ pub fn glyph_file_name(name: &str, existing_lower: &mut HashSet<String>) -> Stri
 /// A whole UFO in memory.
 #[derive(Clone, Debug, Default)]
 pub struct Ufo {
+    /// `fontinfo.plist`.
     pub info: Dict,
+    /// `lib.plist`; not written when empty.
     pub lib: Dict,
+    /// `groups.plist`; not written when empty.
     pub groups: Dict,
+    /// `kerning.plist`; not written when empty.
     pub kerning: Dict,
+    /// `features.fea`; not written when empty.
     pub features: String,
     /// In glyph order.
     pub glyphs: Vec<Glyph>,
 }
 
 impl Ufo {
+    /// The glyph with the given name, if any.
     pub fn glyph(&self, name: &str) -> Option<&Glyph> {
         self.glyphs.iter().find(|g| g.name == name)
     }

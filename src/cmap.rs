@@ -152,6 +152,8 @@ pub struct CharMap {
     pub uvs: Vec<UvsRecord>,
 }
 
+/// Read the `cmap` table. A font without one has no code points and no
+/// variation sequences.
 pub fn char_map(font: &FontRef, num_glyphs: usize) -> Result<CharMap, Error> {
     let Ok(cmap) = font.cmap() else {
         return Ok(CharMap {

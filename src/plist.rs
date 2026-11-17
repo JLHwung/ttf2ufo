@@ -11,13 +11,20 @@ use crate::pyfmt::float_repr;
 /// which is how Python sorts `str` keys.
 pub type Dict = BTreeMap<String, Value>;
 
+/// A plist value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
+    /// `<true/>` or `<false/>`.
     Bool(bool),
+    /// `<integer>`.
     Int(i64),
+    /// `<real>`, formatted like Python's `repr(float)`.
     Real(f64),
+    /// `<string>`.
     Str(String),
+    /// `<array>`.
     Array(Vec<Value>),
+    /// `<dict>`, with keys sorted.
     Dict(Dict),
 }
 

@@ -58,11 +58,14 @@ pub fn float_repr_signed(value: f64) -> String {
 /// `repr` (`1` vs `1.0`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Num {
+    /// A Python `int`.
     Int(i64),
+    /// A Python `float`.
     Float(f64),
 }
 
 impl Num {
+    /// The value as a float.
     pub fn as_f64(self) -> f64 {
         match self {
             Num::Int(i) => i as f64,
@@ -70,6 +73,7 @@ impl Num {
         }
     }
 
+    /// Python's `repr` of the value.
     pub fn repr(self) -> String {
         match self {
             Num::Int(i) => i.to_string(),
